@@ -1,0 +1,103 @@
+# Runs the tests on macOS, Windows and Linux on every push.
+# Pushing a version tag (git tag v0.1.0 && git push origin v0.1.0) also builds
+# the downloads and attaches them to a GitHub release for that tag.
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+# Read-only by default. Only the release job below can write to the repository.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            name: macos-universal
+          - os: windows-latest
+            name: windows-x86_64
+          - os: ubuntu-22.04 # older glibc, so the Linux build runs on more distros
+            name: linux-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      # Actions are pinned to exact commits so a moved tag can't change what runs.
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false # build scripts of dependencies can't read the token
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Check the tag matches Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} doesn't match version ${version} in Cargo.toml"
+            exit 1
+          fi
+
+      - name: Linux libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libgl1-mesa-dev libwayland-dev
+
+      - name: Test
+        run: cargo test
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          sh scripts/package-macos.sh universal
+          cd dist && ditto -c -k --keepParent cedit.app ../cedit-${{ matrix.name }}.zip
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cargo build --release
+          mkdir -p dist/cedit && cp target/release/cedit.exe README.md LICENSE dist/cedit/
+          cd dist && 7z a ../cedit-${{ matrix.name }}.zip cedit
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: sh scripts/package-linux.sh cedit-${{ matrix.name }}.tar.gz
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: cedit-${{ matrix.name }}
+          path: |
+            cedit-*.zip
+            cedit-*.tar.gz
+
+  # Runs after all three builds pass, and only for version tags. It's the only
+  # job allowed to write to the repository, and it runs none of the project's code.
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: cedit-*
+          merge-multiple: true
+          path: dist
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -l dist
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
+            --title "cedit $GITHUB_REF_NAME" --generate-notes --verify-tag
