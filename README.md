@@ -1,7 +1,8 @@
 # cedit
 
 A fast, native code editor for **C**, **GLSL** and **Makefiles**, written in Rust with
-[egui](https://github.com/emilk/egui). One binary that runs on macOS, Windows and Linux.
+[egui](https://github.com/emilk/egui). One binary that runs on macOS, Windows and Linux. Note was made to 
+test what I could do with Claude not to demonstrate my technical skills (and also because I wanted an editor just for C)
 
 ## Download
 
