@@ -31,6 +31,14 @@ struct Session {
     trusted_folders: Vec<PathBuf>,
 }
 
+#[derive(Clone, Copy)]
+enum TabSet {
+    All,
+    Others,
+    Right,
+    Saved,
+}
+
 enum NameKind {
     NewFile,
     NewFolder,
@@ -40,6 +48,8 @@ enum NameKind {
 enum Modal {
     /// Closing a tab with unsaved changes.
     UnsavedClose(u64),
+    /// Closing several tabs, some with unsaved changes.
+    UnsavedCloseMany(Vec<u64>),
     /// Quitting with unsaved changes.
     UnsavedQuit,
     Name {
@@ -447,6 +457,41 @@ impl App {
         }
     }
 
+    /// Close several tabs at once, asking once about any unsaved ones.
+    fn request_close_many(&mut self, ids: Vec<u64>) {
+        if ids.is_empty() {
+            return;
+        }
+        let any_dirty = ids.iter().filter_map(|id| self.doc_index(*id)).any(|i| self.docs[i].dirty);
+        if any_dirty {
+            self.modal = Some(Modal::UnsavedCloseMany(ids));
+        } else {
+            self.close_ids(&ids);
+        }
+    }
+
+    fn close_ids(&mut self, ids: &[u64]) {
+        let keep_active = self.docs.get(self.active).map(|d| d.id).filter(|id| !ids.contains(id));
+        self.docs.retain(|d| !ids.contains(&d.id));
+        self.active = keep_active.and_then(|id| self.doc_index(id)).unwrap_or(0).min(self.docs.len().saturating_sub(1));
+        self.focus_active();
+    }
+
+    /// Ids for "Close All", "Close Others" (keep `keep`), "Close to the Right" and "Close Saved".
+    fn tab_ids(&self, which: TabSet, at: usize) -> Vec<u64> {
+        self.docs
+            .iter()
+            .enumerate()
+            .filter(|(i, d)| match which {
+                TabSet::All => true,
+                TabSet::Others => *i != at,
+                TabSet::Right => *i > at,
+                TabSet::Saved => !d.dirty,
+            })
+            .map(|(_, d)| d.id)
+            .collect()
+    }
+
     fn close_now(&mut self, idx: usize) {
         if idx < self.docs.len() {
             self.docs.remove(idx);
@@ -605,6 +650,7 @@ impl App {
                 A::OpenFile => self.cmd_open_file(),
                 A::OpenFolder => self.cmd_open_folder(),
                 A::CloseTab => self.request_close(self.active),
+                A::CloseAllTabs => self.request_close_many(self.tab_ids(TabSet::All, 0)),
                 A::Find => self.cmd_find(ctx, false),
                 A::Replace => self.cmd_find(ctx, true),
                 A::FindInFiles => self.cmd_find_in_files(ctx),
@@ -960,6 +1006,15 @@ impl App {
                 if ui.add_enabled(has_doc, egui::Button::new("Close Tab").shortcut_text(self.keymap.label(&ctx, crate::settings::Action::CloseTab))).clicked() {
                     self.request_close(self.active);
                 }
+                if ui.add_enabled(has_doc, egui::Button::new("Close All Tabs").shortcut_text(self.keymap.label(&ctx, crate::settings::Action::CloseAllTabs))).clicked() {
+                    self.request_close_many(self.tab_ids(TabSet::All, 0));
+                }
+                if ui.add_enabled(self.docs.len() > 1, egui::Button::new("Close Other Tabs")).clicked() {
+                    self.request_close_many(self.tab_ids(TabSet::Others, self.active));
+                }
+                if ui.add_enabled(self.docs.iter().any(|d| !d.dirty), egui::Button::new("Close Saved Tabs")).clicked() {
+                    self.request_close_many(self.tab_ids(TabSet::Saved, 0));
+                }
                 if ui.add_enabled(self.tree.is_some(), egui::Button::new("Close Folder")).clicked() {
                     self.tree = None;
                 }
@@ -1145,7 +1200,10 @@ impl App {
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             let mut close = None;
+                            let mut close_set: Option<(TabSet, usize)> = None;
+                            let mut copy_path = None;
                             let mut activate = None;
+                            let n = self.docs.len();
                             for (i, d) in self.docs.iter().enumerate() {
                                 let selected = i == self.active;
                                 let label = if d.dirty { format!("{} •", d.title()) } else { d.title() };
@@ -1160,6 +1218,35 @@ impl App {
                                 if let Some(p) = &d.path {
                                     r.clone().on_hover_text(p.display().to_string());
                                 }
+                                r.context_menu(|ui| {
+                                    if ui.button("Close").clicked() {
+                                        close = Some(i);
+                                        ui.close();
+                                    }
+                                    if ui.add_enabled(n > 1, egui::Button::new("Close Others")).clicked() {
+                                        close_set = Some((TabSet::Others, i));
+                                        ui.close();
+                                    }
+                                    if ui.add_enabled(i + 1 < n, egui::Button::new("Close to the Right")).clicked() {
+                                        close_set = Some((TabSet::Right, i));
+                                        ui.close();
+                                    }
+                                    if ui.button("Close Saved").clicked() {
+                                        close_set = Some((TabSet::Saved, i));
+                                        ui.close();
+                                    }
+                                    if ui.button("Close All").clicked() {
+                                        close_set = Some((TabSet::All, i));
+                                        ui.close();
+                                    }
+                                    if let Some(p) = &d.path {
+                                        ui.separator();
+                                        if ui.button("Copy Path").clicked() {
+                                            copy_path = Some(p.display().to_string());
+                                            ui.close();
+                                        }
+                                    }
+                                });
                                 if ui.add(egui::Button::new(RichText::new("×").weak()).frame(false)).on_hover_text("Close").clicked() {
                                     close = Some(i);
                                 }
@@ -1171,6 +1258,12 @@ impl App {
                             }
                             if let Some(i) = close {
                                 self.request_close(i);
+                            }
+                            if let Some((set, at)) = close_set {
+                                self.request_close_many(self.tab_ids(set, at));
+                            }
+                            if let Some(p) = copy_path {
+                                ui.ctx().copy_text(p);
                             }
                         });
                     });
@@ -1659,6 +1752,49 @@ impl App {
                 }
                 if keep {
                     self.modal = Some(Modal::UnsavedClose(id));
+                }
+            }
+            Modal::UnsavedCloseMany(ids) => {
+                let dirty: Vec<String> = ids.iter().filter_map(|id| self.doc_index(*id)).filter(|i| self.docs[*i].dirty).map(|i| self.docs[i].title()).collect();
+                let mut choice = None;
+                egui::Modal::new(egui::Id::unique("unsaved-close-many")).show(ctx, |ui| {
+                    ui.label(RichText::new(if dirty.len() == 1 { "Save changes to this file?".to_string() } else { format!("Save changes to {} files?", dirty.len()) }).strong());
+                    for d in &dirty {
+                        ui.label(format!("• {d}"));
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Save and Close").clicked() {
+                            choice = Some(0);
+                        }
+                        if ui.button("Don't Save").clicked() {
+                            choice = Some(1);
+                        }
+                        if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                            choice = Some(2);
+                        }
+                    });
+                });
+                match choice {
+                    Some(0) => {
+                        for id in &ids {
+                            if let Some(i) = self.doc_index(*id)
+                                && self.docs[i].dirty
+                            {
+                                if self.docs[i].path.is_some() {
+                                    self.save_doc_now(ctx, i);
+                                } else {
+                                    self.save_doc_as(ctx, i);
+                                }
+                            }
+                        }
+                        // Anything that still couldn't be saved stays open.
+                        let done: Vec<u64> = ids.iter().copied().filter(|id| self.doc_index(*id).is_some_and(|i| !self.docs[i].dirty)).collect();
+                        self.close_ids(&done);
+                    }
+                    Some(1) => self.close_ids(&ids),
+                    Some(_) => {}
+                    None => self.modal = Some(Modal::UnsavedCloseMany(ids)),
                 }
             }
             Modal::UnsavedQuit => {

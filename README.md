@@ -256,7 +256,7 @@ you can rebind. *Help → Keyboard Shortcuts* shows the current bindings.
 | Tab / Shift+Tab | Indent / unindent |
 | Cmd+S, Cmd+Shift+S, Cmd+Alt+S | Save, save as, save all |
 | Cmd+N, Cmd+O, Cmd+Shift+O | New file, open file, open folder |
-| Cmd+W | Close tab |
+| Cmd+W / Cmd+Alt+W | Close tab / close all tabs (right-click a tab for Close Others, Close to the Right, Close Saved) |
 | Ctrl+Tab | Next tab |
 | Cmd+1 / Cmd+J | Toggle sidebar / bottom panel |
 | Ctrl+\` / Ctrl+Shift+\` | Show or hide the terminal / new terminal |

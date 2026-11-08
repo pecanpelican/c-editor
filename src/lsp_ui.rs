@@ -97,6 +97,47 @@ pub(super) struct LspState {
     pub sig: Option<SigState>,
     pub actions: Option<ActionMenu>,
     pub symbols: Option<SymbolPicker>,
+    /// Modification times of clangd's settings files and the Makefile, to
+    /// restart clangd when they change.
+    config_stamp: Option<(u64, u64)>,
+    config_checked_at: f64,
+}
+
+/// Hash of the modification times of clangd's settings files that apply to
+/// `files` (every folder above each file), and of the Makefile.
+fn config_stamp(root: &Path, files: &[PathBuf], makefile: Option<&Path>) -> (u64, u64) {
+    use std::hash::{Hash, Hasher};
+    let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let mut dirs: HashSet<PathBuf> = HashSet::new();
+    dirs.insert(root.to_path_buf());
+    dirs.insert(root.join("build"));
+    for f in files {
+        let mut d = f.parent();
+        while let Some(dir) = d {
+            // clangd also reads .clangd files above the project folder.
+            if !dirs.insert(dir.to_path_buf()) {
+                break;
+            }
+            d = dir.parent();
+        }
+    }
+    let mut dirs: Vec<PathBuf> = dirs.into_iter().collect();
+    dirs.sort();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for d in &dirs {
+        for name in [".clangd", "compile_flags.txt", "compile_commands.json"] {
+            let p = d.join(name);
+            if let Some(t) = mtime(&p) {
+                p.hash(&mut h);
+                t.hash(&mut h);
+            }
+        }
+    }
+    let mut m = std::collections::hash_map::DefaultHasher::new();
+    if let Some(t) = makefile.and_then(mtime) {
+        t.hash(&mut m);
+    }
+    (h.finish(), m.finish())
 }
 
 fn is_word_char(c: char) -> bool {
@@ -146,6 +187,7 @@ impl LspState {
         self.db_job = None;
         self.db_checked = false;
         self.failed.clear();
+        self.config_stamp = None;
     }
 }
 
@@ -159,6 +201,33 @@ impl App {
         }
         let Some(root) = root else { return };
         let now = ctx.input(|i| i.time);
+
+        // Restart clangd when its settings (.clangd, compile_commands.json, ...)
+        // change, and re-read the Makefile's flags when the Makefile changes.
+        if now - self.lsp.config_checked_at > 2.0 {
+            self.lsp.config_checked_at = now;
+            let files: Vec<PathBuf> = self
+                .docs
+                .iter()
+                .filter_map(|d| d.path.clone())
+                .filter(|p| ServerKind::for_path(p) == Some(ServerKind::Clangd))
+                .collect();
+            let stamp = config_stamp(&root, &files, self.makefile.as_deref());
+            if let Some(old) = self.lsp.config_stamp
+                && old != stamp
+            {
+                if old.1 != stamp.1 && self.lsp.compile_db.is_some() {
+                    self.lsp.db_checked = false; // regenerate, then restart
+                } else if old.0 != stamp.0 && self.lsp.servers.contains_key(&ServerKind::Clangd) {
+                    self.lsp.servers.remove(&ServerKind::Clangd);
+                    self.lsp.failed.remove(&ServerKind::Clangd);
+                    self.lsp.seen.retain(|p, _| ServerKind::for_path(p) != Some(ServerKind::Clangd));
+                    self.lsp.sem_requested.retain(|p, _| ServerKind::for_path(p) != Some(ServerKind::Clangd));
+                    self.lsp.status = "clangd settings changed, restarting clangd".into();
+                }
+            }
+            self.lsp.config_stamp = Some(stamp);
+        }
 
         // compile_commands.json from the Makefile (clangd needs your flags).
         // Only in a trusted folder: `make -n` still runs $(shell ...) and `+` lines.
@@ -1312,5 +1381,19 @@ mod tests {
         assert_eq!(word_at(t, 4), 4..11);
         assert_eq!(word_at(t, 11), 4..11);
         assert_eq!(word_at(t, 12), 12..12);
+    }
+
+    #[test]
+    fn clangd_config_changes_are_noticed() {
+        let d = std::env::temp_dir().join(format!("cedit-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        let f = d.join("src/a.m");
+        std::fs::write(&f, "").unwrap();
+        let a = config_stamp(&d, std::slice::from_ref(&f), None);
+        std::fs::write(d.join(".clangd"), "CompileFlags:\n  Add: [-xc]\n").unwrap();
+        let b = config_stamp(&d, std::slice::from_ref(&f), None);
+        assert_ne!(a.0, b.0);
+        assert_eq!(a.1, b.1);
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
