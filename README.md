@@ -1,6 +1,6 @@
 # cedit
 
-A fast, native code editor for **C**, **GLSL** and **Makefiles**, written in Rust with
+A fast, native code editor for **C** (and Objective-C), **GLSL** and **Makefiles**, written in Rust with
 [egui](https://github.com/emilk/egui). One binary that runs on macOS, Windows and Linux.
 
 ## Download
@@ -84,7 +84,7 @@ For profiling on Linux, install `perf` (see *Performance analyzer* below).
 **Editing**
 - File tree (new file/folder, rename, move to trash, copy path, reveal in Finder/Explorer)
 - Tabs, unsaved markers, prompts before closing or quitting with unsaved work
-- Highlighting for C, GLSL/shader files and Makefiles, plus type/function/macro colouring
+- Highlighting for C, Objective-C (.m, .mm), GLSL/shader files and Makefiles, plus type/function/macro colouring
   from clangd
 - Auto-indent, smart `}` dedent, Tab/Shift+Tab block indent, real tabs in Makefiles
 - Toggle comment, duplicate line, delete line

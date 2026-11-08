@@ -708,8 +708,8 @@ impl App {
         let Some(path) = self.docs.get(self.active).and_then(|d| d.path.clone()) else { return };
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default();
         let others: &[&str] = match ext {
-            "h" => &["c", "cc", "cpp", "m"],
-            "c" | "cc" | "cpp" | "m" => &["h", "hpp"],
+            "h" => &["c", "m", "cc", "cpp", "mm"],
+            "c" | "cc" | "cpp" | "m" | "mm" => &["h", "hpp"],
             _ => &[],
         };
         for o in others {

@@ -30,7 +30,7 @@ impl ServerKind {
     pub fn for_path(path: &Path) -> Option<Self> {
         let ext = path.extension()?.to_str()?.to_ascii_lowercase();
         match ext.as_str() {
-            "c" | "h" | "inc" | "cc" | "cpp" | "cxx" | "hpp" | "hh" | "m" => Some(ServerKind::Clangd),
+            "c" | "h" | "inc" | "cc" | "cpp" | "cxx" | "hpp" | "hh" | "m" | "mm" => Some(ServerKind::Clangd),
             "glsl" | "vert" | "frag" | "geom" | "comp" | "tesc" | "tese" | "mesh" | "task" | "rgen"
             | "rint" | "rahit" | "rchit" | "rmiss" | "rcall" | "vs" | "fs" | "gs" => Some(ServerKind::GlslAnalyzer),
             _ => None,
@@ -42,6 +42,7 @@ impl ServerKind {
             "c" | "h" | "inc" => "c",
             "cc" | "cpp" | "cxx" | "hpp" | "hh" => "cpp",
             "m" => "objective-c",
+            "mm" => "objective-cpp",
             _ => "glsl",
         }
     }
@@ -404,6 +405,13 @@ impl Server {
             },
             "clientInfo": { "name": "cedit" }
         });
+        let mut params = params;
+        if kind == ServerKind::Clangd {
+            let flags = fallback_flags(root);
+            if !flags.is_empty() {
+                params["initializationOptions"] = json!({ "fallbackFlags": flags });
+            }
+        }
         let id = s.alloc(Pending::Initialize);
         s.send_now(&json!({ "jsonrpc": "2.0", "id": id, "method": "initialize", "params": params }));
         Ok(s)
@@ -976,7 +984,7 @@ fn is_compiler(word: &str) -> bool {
 
 fn is_source(arg: &str) -> bool {
     let lower = arg.to_ascii_lowercase();
-    [".c", ".cc", ".cpp", ".cxx", ".m", ".s"].iter().any(|e| lower.ends_with(e)) && !arg.starts_with('-')
+    [".c", ".cc", ".cpp", ".cxx", ".m", ".mm", ".s"].iter().any(|e| lower.ends_with(e)) && !arg.starts_with('-')
 }
 
 /// Turn `make -n` output into compile_commands.json entries.
@@ -1028,6 +1036,54 @@ pub fn compile_commands_from_dry_run(output: &str, start_dir: &Path) -> Vec<Valu
     out
 }
 
+/// Extra clangd flags for files it has no compile command for. clangd reads a
+/// lone `.h` as C, so in an Objective-C project `@interface` and
+/// `@autoreleasepool` in headers come up as errors. Objective-C is a superset
+/// of C, so `.c` files are fine with the flag; C++ files aren't, so mixed
+/// C++ projects are left alone.
+pub fn fallback_flags(root: &Path) -> Vec<String> {
+    let (mut objc, mut objcpp, mut c, mut cpp) = (false, false, false, false);
+    let mut stack = vec![(root.to_path_buf(), 0)];
+    let mut seen = 0;
+    while let Some((dir, depth)) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for e in rd.flatten() {
+            seen += 1;
+            if seen > 5000 {
+                stack.clear();
+                break;
+            }
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') {
+                continue;
+            }
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_dir() {
+                if depth < 6 && !matches!(name.as_ref(), "target" | "node_modules" | "build" | "dist" | "DerivedData") {
+                    stack.push((e.path(), depth + 1));
+                }
+                continue;
+            }
+            match Path::new(name.as_ref()).extension().and_then(|x| x.to_str()).unwrap_or_default() {
+                "m" => objc = true,
+                "mm" => objcpp = true,
+                "c" => c = true,
+                "cc" | "cpp" | "cxx" => cpp = true,
+                _ => {}
+            }
+        }
+    }
+    let lang = if objcpp && !c && !objc {
+        "objective-c++"
+    } else if (objc || objcpp) && !cpp {
+        "objective-c"
+    } else {
+        return Vec::new();
+    };
+    vec!["-x".into(), lang.into()]
+}
+
 /// Where generated compile databases go (outside the user's project).
 pub fn cache_dir_for(root: &Path) -> Option<PathBuf> {
     let base = if cfg!(target_os = "macos") {
@@ -1043,6 +1099,85 @@ pub fn cache_dir_for(root: &Path) -> Option<PathBuf> {
     let hash = crate::find::hash_text(&root.to_string_lossy());
     let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     Some(base.join(format!("{name}-{hash:016x}")))
+}
+
+/// `.h` files under `dir` (a bounded walk).
+fn list_headers(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![(dir.to_path_buf(), 0)];
+    let mut seen = 0;
+    while let Some((d, depth)) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            seen += 1;
+            if seen > 5000 {
+                return out;
+            }
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') {
+                continue;
+            }
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_dir() {
+                if depth < 6 && !matches!(name.as_ref(), "target" | "node_modules" | "build" | "dist" | "DerivedData") {
+                    stack.push((e.path(), depth + 1));
+                }
+            } else if name.ends_with(".h") {
+                out.push(e.path());
+            }
+        }
+    }
+    out
+}
+
+/// In an Objective-C project, give headers their own entries using an
+/// Objective-C file's flags. Otherwise clangd borrows the flags of whichever
+/// `.c` file has the closest name and reads `@interface` as a C error.
+fn add_objc_headers(entries: &mut Vec<Value>, headers: &[PathBuf]) {
+    let file_of = |e: &Value| e["file"].as_str().unwrap_or_default().to_ascii_lowercase();
+    let has_cpp = entries.iter().any(|e| {
+        let f = file_of(e);
+        f.ends_with(".cpp") || f.ends_with(".cc") || f.ends_with(".cxx")
+    });
+    let template = entries
+        .iter()
+        .find(|e| file_of(e).ends_with(".m"))
+        .filter(|_| !has_cpp)
+        .map(|e| (e.clone(), "objective-c-header"))
+        .or_else(|| entries.iter().find(|e| file_of(e).ends_with(".mm")).map(|e| (e.clone(), "objective-c++-header")));
+    let Some((t, lang)) = template else { return };
+    let known: std::collections::HashSet<String> = entries.iter().map(|e| e["file"].as_str().unwrap_or_default().to_string()).collect();
+    let args: Vec<String> = t["arguments"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
+    // Keep the compiler and its flags; drop sources, `-c` and `-o out`.
+    let mut flags = Vec::new();
+    let mut skip = false;
+    for a in &args {
+        if skip {
+            skip = false;
+            continue;
+        }
+        if a == "-o" {
+            skip = true;
+            continue;
+        }
+        if a == "-c" || is_source(a) {
+            continue;
+        }
+        flags.push(a.clone());
+    }
+    if flags.is_empty() {
+        return;
+    }
+    for h in headers {
+        let file = h.to_string_lossy().to_string();
+        if known.contains(&file) {
+            continue;
+        }
+        let mut a = flags.clone();
+        a.extend(["-x".to_string(), lang.to_string(), file.clone()]);
+        entries.push(json!({ "directory": t["directory"], "arguments": a, "file": file }));
+    }
 }
 
 /// Does the project already provide compile flags for clangd?
@@ -1064,10 +1199,11 @@ pub fn generate_compile_commands(make: &str, dir: &Path, extra: &[String], out_d
     }
     let output = cmd.output().map_err(|e| format!("couldn't run {make}: {e}"))?;
     let text = String::from_utf8_lossy(&output.stdout);
-    let entries = compile_commands_from_dry_run(&text, dir);
+    let mut entries = compile_commands_from_dry_run(&text, dir);
     if entries.is_empty() {
         return Err("no compiler commands found in `make -n` output".into());
     }
+    add_objc_headers(&mut entries, &list_headers(dir));
     std::fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
     let json = serde_json::to_string_pretty(&Value::Array(entries.clone())).map_err(|e| e.to_string())?;
     std::fs::write(out_dir.join("compile_commands.json"), json).map_err(|e| e.to_string())?;
@@ -1077,6 +1213,33 @@ pub fn generate_compile_commands(make: &str, dir: &Path, extra: &[String], out_d
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn objc_header_entries() {
+        let out = "cc -c util.c -o util.o\nclang -fobjc-arc -Iinc -c main.m -o main.o\n";
+        let mut e = compile_commands_from_dry_run(out, Path::new("/p"));
+        add_objc_headers(&mut e, &[PathBuf::from("/p/inc/greeter.h")]);
+        assert_eq!(e.len(), 3);
+        let a: Vec<&str> = e[2]["arguments"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(a, vec!["clang", "-fobjc-arc", "-Iinc", "-x", "objective-c-header", "/p/inc/greeter.h"]);
+        // Plain C projects are untouched.
+        let mut e = compile_commands_from_dry_run("cc -c util.c\n", Path::new("/p"));
+        add_objc_headers(&mut e, &[PathBuf::from("/p/a.h")]);
+        assert_eq!(e.len(), 1);
+    }
+
+    #[test]
+    fn objc_fallback() {
+        let d = std::env::temp_dir().join(format!("cedit-objc-{}", std::process::id()));
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        assert!(fallback_flags(&d).is_empty());
+        std::fs::write(d.join("src/main.m"), "").unwrap();
+        std::fs::write(d.join("util.c"), "").unwrap();
+        assert_eq!(fallback_flags(&d), vec!["-x", "objective-c"]);
+        std::fs::write(d.join("x.cpp"), "").unwrap();
+        assert!(fallback_flags(&d).is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn edits_keep_cursor() {

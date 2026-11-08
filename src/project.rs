@@ -245,6 +245,7 @@ fn file_color(name: &str, theme: &Theme) -> egui::Color32 {
                 theme.text
             }
         }
+        crate::highlight::Language::ObjC => theme.text,
         crate::highlight::Language::Glsl => theme.string,
         crate::highlight::Language::Make => theme.keyword,
         crate::highlight::Language::Plain => theme.punct,

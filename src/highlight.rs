@@ -1,4 +1,4 @@
-//! Fast, dependency-free syntax highlighting for C, GLSL and Makefiles.
+//! Fast, dependency-free syntax highlighting for C, Objective-C, GLSL and Makefiles.
 //!
 //! The lexers are hand-written and run over the whole buffer. They are
 //! designed to be cheap enough to rerun on every edit (a 100k line file
@@ -16,6 +16,8 @@ use crate::theme::Theme;
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub enum Language {
     C,
+    /// Objective-C and Objective-C++ (.m, .mm)
+    ObjC,
     Glsl,
     Make,
     Plain,
@@ -36,7 +38,8 @@ impl Language {
             .unwrap_or_default()
             .to_ascii_lowercase();
         match ext.as_str() {
-            "c" | "h" | "inc" | "cc" | "cpp" | "cxx" | "hpp" | "hh" | "m" => Language::C,
+            "c" | "h" | "inc" | "cc" | "cpp" | "cxx" | "hpp" | "hh" => Language::C,
+            "m" | "mm" => Language::ObjC,
             "glsl" | "vert" | "frag" | "geom" | "comp" | "tesc" | "tese" | "vs" | "fs" | "gs"
             | "mesh" | "task" | "rgen" | "rint" | "rahit" | "rchit" | "rmiss" | "rcall"
             | "hlsl" | "fx" | "fxh" | "metal" | "wgsl" | "shader" => Language::Glsl,
@@ -48,6 +51,7 @@ impl Language {
     pub fn name(self) -> &'static str {
         match self {
             Language::C => "C",
+            Language::ObjC => "Objective-C",
             Language::Glsl => "GLSL",
             Language::Make => "Makefile",
             Language::Plain => "Plain Text",
@@ -57,7 +61,7 @@ impl Language {
     /// The prefix used by "toggle comment".
     pub fn line_comment(self) -> Option<&'static str> {
         match self {
-            Language::C | Language::Glsl => Some("//"),
+            Language::C | Language::ObjC | Language::Glsl => Some("//"),
             Language::Make => Some("#"),
             Language::Plain => None,
         }
@@ -89,8 +93,9 @@ pub type Spans = Vec<(Range<usize>, Tok)>;
 
 pub fn tokenize(lang: Language, text: &str) -> Spans {
     match lang {
-        Language::C => lex_c_family(text, false),
-        Language::Glsl => lex_c_family(text, true),
+        Language::C => lex_c_family(text, Dialect::C),
+        Language::ObjC => lex_c_family(text, Dialect::ObjC),
+        Language::Glsl => lex_c_family(text, Dialect::Glsl),
         Language::Make => lex_make(text),
         Language::Plain => vec![(0..text.len(), Tok::Normal)],
     }
@@ -190,6 +195,27 @@ const C_TYPES: &[&str] = &[
 
 const C_CONSTANTS: &[&str] = &["true", "false", "NULL", "nullptr", "stdin", "stdout", "stderr"];
 
+// Only in .m/.mm files: `id` and `self` are ordinary names in C.
+const OBJC_KEYWORDS: &[&str] = &[
+    "self", "super", "__weak", "__strong", "__block", "__unsafe_unretained", "__autoreleasing",
+    "__bridge", "__bridge_transfer", "__bridge_retained", "__kindof", "_Nullable", "_Nonnull",
+    "_Null_unspecified", "nullable", "nonnull", "null_unspecified",
+];
+
+const OBJC_TYPES: &[&str] = &[
+    "id", "SEL", "BOOL", "IMP", "Class", "Protocol", "instancetype", "NSInteger", "NSUInteger",
+    "CGFloat",
+];
+
+const OBJC_CONSTANTS: &[&str] = &["YES", "NO", "nil", "Nil"];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Dialect {
+    C,
+    ObjC,
+    Glsl,
+}
+
 const GLSL_KEYWORDS: &[&str] = &[
     "attribute", "const", "uniform", "varying", "buffer", "shared", "coherent", "volatile",
     "restrict", "readonly", "writeonly", "layout", "centroid", "flat", "smooth",
@@ -287,8 +313,19 @@ fn is_glsl_composite_type(word: &str) -> bool {
     })
 }
 
-fn classify_c_ident(word: &str, glsl: bool) -> Option<Tok> {
-    if glsl {
+fn classify_c_ident(word: &str, dialect: Dialect) -> Option<Tok> {
+    if dialect == Dialect::ObjC {
+        if OBJC_KEYWORDS.contains(&word) {
+            return Some(Tok::Keyword);
+        }
+        if OBJC_TYPES.contains(&word) {
+            return Some(Tok::Type);
+        }
+        if OBJC_CONSTANTS.contains(&word) {
+            return Some(Tok::Constant);
+        }
+    }
+    if dialect == Dialect::Glsl {
         if GLSL_KEYWORDS.contains(&word) {
             return Some(Tok::Keyword);
         }
@@ -312,7 +349,7 @@ fn classify_c_ident(word: &str, glsl: bool) -> Option<Tok> {
     None
 }
 
-fn lex_c_family(text: &str, glsl: bool) -> Spans {
+fn lex_c_family(text: &str, dialect: Dialect) -> Spans {
     let b = text.as_bytes();
     let n = b.len();
     let mut out = SpanBuilder::new(n / 4);
@@ -392,6 +429,48 @@ fn lex_c_family(text: &str, glsl: bool) -> Spans {
             i = j;
             continue;
         }
+        // Objective-C: `@interface`, `@autoreleasepool`, `@"string"`, `@42`. `@` isn't valid
+        // C, so this is safe in headers too.
+        if c == b'@' && dialect != Dialect::Glsl && i + 1 < n {
+            let d = b[i + 1];
+            if is_ident_start(d) {
+                let mut j = i + 1;
+                while j < n && is_ident(b[j]) {
+                    j += 1;
+                }
+                out.push_word(i..j, Tok::Keyword);
+                i = j;
+                continue;
+            }
+            if d == b'"' || d.is_ascii_digit() {
+                // The string or number token includes the `@`.
+                let start = i;
+                i += 1;
+                if d == b'"' {
+                    let mut j = i + 1;
+                    while j < n && b[j] != b'"' && b[j] != b'\n' {
+                        if b[j] == b'\\' && j + 1 < n {
+                            j += 1;
+                        }
+                        j += utf8_len(b[j]);
+                    }
+                    if j < n && b[j] == b'"' {
+                        j += 1;
+                    }
+                    let j = j.min(n);
+                    out.push(start..j, Tok::Str);
+                    i = j;
+                } else {
+                    let mut j = i;
+                    while j < n && (is_ident(b[j]) || b[j] == b'.') {
+                        j += 1;
+                    }
+                    out.push(start..j, Tok::Number);
+                    i = j;
+                }
+                continue;
+            }
+        }
         // Strings and chars
         if c == b'"' || c == b'\'' {
             let quote = c;
@@ -438,7 +517,7 @@ fn lex_c_family(text: &str, glsl: bool) -> Spans {
                 j += 1;
             }
             let word = &text[i..j];
-            let tok = if let Some(tok) = classify_c_ident(word, glsl) {
+            let tok = if let Some(tok) = classify_c_ident(word, dialect) {
                 tok
             } else {
                 // Look ahead for '(' -> function call / definition.
@@ -688,6 +767,25 @@ mod tests {
         assert_eq!(find("MAX_SIZE"), Tok::Constant);
         assert_eq!(find("0x1Fu"), Tok::Number);
         assert_eq!(find("// c"), Tok::Comment);
+    }
+
+    #[test]
+    fn objc_tokens() {
+        let src = "@interface A : NSObject\n- (id)f { @autoreleasepool { NSLog(@\"x\", @42, YES, self); } }\n@end\n";
+        let spans = tokenize(Language::ObjC, src);
+        let find = |s: &str| spans.iter().find(|(r, _)| &src[r.clone()] == s).map(|(_, t)| *t);
+        assert_eq!(find("@interface"), Some(Tok::Keyword));
+        assert_eq!(find("@autoreleasepool"), Some(Tok::Keyword));
+        assert_eq!(find("@\"x\""), Some(Tok::Str));
+        assert_eq!(find("@42"), Some(Tok::Number));
+        assert_eq!(find("YES"), Some(Tok::Constant));
+        assert_eq!(find("self"), Some(Tok::Keyword));
+        assert_eq!(find("id"), Some(Tok::Type));
+        // In plain C, `id` and `self` are just names.
+        let c = tokenize(Language::C, "int id = self;");
+        let src2 = "int id = self;";
+        assert!(c.iter().filter(|(_, t)| *t == Tok::Type).all(|(r, _)| &src2[r.clone()] == "int"));
+        assert_eq!(Language::from_path(Path::new("x.mm")), Language::ObjC);
     }
 
     #[test]
