@@ -93,6 +93,14 @@ For profiling on Linux, install `perf` (see *Performance analyzer* below).
 - Keeps CRLF line endings; saves atomically; trims trailing whitespace on save (configurable)
 - Remembers your folder, tabs and zoom; drag and drop files or folders
 
+**Viewing images, PDFs and Markdown**
+- Images (PNG, JPEG, GIF, BMP, WebP, ICO, TIFF) open in a viewer tab: fit to window or 100%,
+  scroll or pinch to zoom around the pointer, drag to pan, double-click to toggle
+- PDFs open in a viewer tab with page navigation, fit-width and zoom. Rendering is pure Rust
+  (no Pdfium or Poppler needed); encrypted PDFs aren't supported yet
+- Markdown files open in the editor with a live rendered preview beside it (tables, task lists,
+  code blocks, local images). Toggle it with *View → Markdown Preview* or the status bar
+
 **Building with Make**
 - Finds the Makefile nearest the current file and lists its targets in the toolbar
 - **Build** (Cmd+B) saves everything and runs `make` with the selected target
@@ -291,6 +299,7 @@ MIT, see [LICENSE](LICENSE).
 | --- | --- |
 | `src/app.rs` | Window layout, menus, shortcuts, dialogs |
 | `src/editor.rs` | Open documents and the code editor widget |
+| `src/viewer.rs` | Image and PDF viewer tabs |
 | `src/textops.rs` | Editing operations (indent, comment, …) |
 | `src/highlight.rs` | Lexers for C, GLSL and Make |
 | `src/find.rs` | In-file search |

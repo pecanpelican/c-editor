@@ -16,6 +16,7 @@ use crate::find::{FindState, hash_text};
 use crate::highlight::{self, Language};
 use crate::textops;
 use crate::theme::Theme;
+use crate::viewer::{Viewer, ViewerKind};
 
 static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
@@ -50,6 +51,10 @@ pub struct Document {
     pub cursor_byte: usize,
     galley_cache: Option<(u64, Arc<Galley>)>,
     last_cursor: Option<(usize, usize, usize)>,
+    /// Images and PDFs open in a read-only viewer instead of the text editor.
+    pub viewer: Option<Viewer>,
+    /// Markdown files: show the rendered preview beside the editor.
+    pub md_preview: bool,
 }
 
 pub enum OpenError {
@@ -94,6 +99,15 @@ impl Document {
     }
 
     pub fn open(path: &Path) -> Result<Self, OpenError> {
+        if let Some(kind) = ViewerKind::for_path(path) {
+            let meta = std::fs::metadata(path).map_err(OpenError::Io)?;
+            if meta.is_dir() {
+                return Err(OpenError::Io(std::io::Error::other("is a directory")));
+            }
+            let mut doc = Self::from_parts(Some(path.to_path_buf()), String::new(), false, meta.modified().ok());
+            doc.viewer = Some(Viewer::new(kind, path));
+            return Ok(doc);
+        }
         let (text, crlf, mtime) = read_text_file(path)?;
         Ok(Self::from_parts(Some(path.to_path_buf()), text, crlf, mtime))
     }
@@ -124,6 +138,8 @@ impl Document {
             cursor_byte: 0,
             galley_cache: None,
             last_cursor: None,
+            viewer: None,
+            md_preview: true,
         }
     }
 
@@ -133,6 +149,13 @@ impl Document {
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "untitled".to_string())
+    }
+
+    pub fn is_markdown(&self) -> bool {
+        self.viewer.is_none()
+            && self.path.as_ref().and_then(|p| p.extension()).and_then(|e| e.to_str()).is_some_and(|e| {
+                matches!(e.to_ascii_lowercase().as_str(), "md" | "markdown" | "mdown" | "mkd")
+            })
     }
 
     pub fn text_edit_id(&self) -> Id {
@@ -149,6 +172,10 @@ impl Document {
     }
 
     pub fn save(&mut self) -> std::io::Result<()> {
+        if self.viewer.is_some() {
+            // Viewer tabs are read-only; never write the empty buffer over the file.
+            return Ok(());
+        }
         let Some(path) = self.path.clone() else {
             return Err(std::io::Error::other("no path"));
         };
@@ -180,6 +207,9 @@ impl Document {
     }
 
     pub fn save_as(&mut self, path: PathBuf) -> std::io::Result<()> {
+        if self.viewer.is_some() {
+            return Err(std::io::Error::other("this file is open in a read-only viewer"));
+        }
         self.lang = Language::from_path(&path);
         self.path = Some(path);
         self.galley_cache = None;
@@ -209,6 +239,11 @@ impl Document {
 
     pub fn reload(&mut self) -> bool {
         let Some(path) = self.path.clone() else { return false };
+        if let Some(v) = &self.viewer {
+            self.viewer = Some(Viewer::new(v.kind(), &path));
+            self.mtime = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
+            return true;
+        }
         match read_text_file(&path) {
             Ok((text, crlf, mtime)) => {
                 self.saved = text.clone();

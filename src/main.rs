@@ -14,6 +14,7 @@ mod project;
 mod settings;
 mod textops;
 mod theme;
+mod viewer;
 
 use std::path::PathBuf;
 

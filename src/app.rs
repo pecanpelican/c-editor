@@ -104,6 +104,7 @@ pub struct App {
     theme: Theme,
     font_size: f32,
     docs: Vec<Document>,
+    md_cache: egui_commonmark::CommonMarkCache,
     active: usize,
     tree: Option<FileTree>,
     sidebar: bool,
@@ -163,6 +164,8 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, args: Vec<PathBuf>) -> Self {
         let theme = Theme::dark();
         theme.apply(&cc.egui_ctx);
+        // Lets the Markdown preview show local images.
+        egui_extras::install_image_loaders(&cc.egui_ctx);
         cc.egui_ctx.global_style_mut(|s| {
             s.spacing.item_spacing = egui::vec2(6.0, 3.0);
             s.spacing.button_padding = egui::vec2(6.0, 2.0);
@@ -178,6 +181,7 @@ impl App {
             theme,
             font_size: settings.font_size,
             docs: Vec::new(),
+            md_cache: Default::default(),
             active: 0,
             tree: None,
             sidebar: session.sidebar.unwrap_or(true),
@@ -1064,6 +1068,13 @@ impl App {
             self.code_menu(ui);
             self.build_menu(ui);
             ui.menu_button("View", |ui| {
+                let md = self.docs.get(self.active).and_then(|d| d.is_markdown().then_some(d.md_preview));
+                if ui.add_enabled(md.is_some(), egui::Button::selectable(md == Some(true), "Markdown Preview")).clicked()
+                    && let Some(d) = self.docs.get_mut(self.active)
+                {
+                    d.md_preview = !d.md_preview;
+                }
+                ui.separator();
                 if ui.add(egui::Button::new("Toggle Sidebar").shortcut_text(self.keymap.label(&ctx, crate::settings::Action::ToggleSidebar))).clicked() {
                     self.sidebar = !self.sidebar;
                 }
@@ -1110,13 +1121,31 @@ impl App {
                     .to_string()
             })
             .unwrap_or_else(|| "untitled".into());
-        let lang = d.lang.name();
+        if let Some(v) = &d.viewer {
+            let (kind, status) = (v.kind().name(), v.status());
+            ui.horizontal_centered(|ui| {
+                ui.label(RichText::new(path).weak());
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(kind);
+                    ui.separator();
+                    ui.label(status);
+                });
+            });
+            return;
+        }
+        let md = d.is_markdown().then_some(d.md_preview);
+        let lang = if md.is_some() { "Markdown" } else { d.lang.name() };
         let crlf = d.crlf;
         let (l, c) = d.cursor_line_col;
         let sel = d.selection_chars;
         ui.horizontal_centered(|ui| {
             ui.label(RichText::new(path).weak());
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if let Some(on) = md
+                    && ui.selectable_label(on, "Preview").on_hover_text("Show the rendered Markdown").clicked()
+                {
+                    self.docs[self.active].md_preview = !on;
+                }
                 ui.label(lang);
                 ui.separator();
                 self.lsp_status_ui(ui);
@@ -1291,9 +1320,16 @@ impl App {
                 });
         }
 
+        if let Some(v) = &mut self.docs[self.active].viewer {
+            v.show(ui, &theme);
+            return;
+        }
+
         if self.find.open {
             self.find_bar(ui);
         }
+
+        self.markdown_preview(ui);
 
         let doc = &mut self.docs[self.active];
         if self.find.open {
@@ -1345,6 +1381,58 @@ impl App {
             self.cmd_definition_at(&ctx, Some(b));
         }
         let _ = ctx;
+    }
+
+    /// Rendered Markdown beside the editor, updated as you type.
+    fn markdown_preview(&mut self, ui: &mut Ui) {
+        let doc = &self.docs[self.active];
+        if !doc.is_markdown() || !doc.md_preview {
+            return;
+        }
+        let base = doc
+            .path
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(|d| format!("file://{}/", d.display()))
+            .unwrap_or_else(|| "file://".into());
+        let (id, text) = (doc.id, &doc.text);
+        let cache = &mut self.md_cache;
+        let theme = &self.theme;
+        let mut hide = false;
+        egui::Panel::right("md-preview")
+            .resizable(true)
+            .default_size(ui.available_width() * 0.5)
+            .min_size(160.0)
+            .frame(egui::Frame::NONE.fill(theme.bg))
+            .show(ui, |ui| {
+                egui::Frame::NONE
+                    .fill(theme.panel_bg)
+                    .inner_margin(egui::Margin::symmetric(8, 3))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Preview").weak());
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui.add(egui::Button::new(RichText::new("×").weak()).frame(false)).on_hover_text("Hide preview").clicked() {
+                                    hide = true;
+                                }
+                            });
+                        });
+                    });
+                egui::ScrollArea::vertical()
+                    .id_salt(("md-preview", id))
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        egui::Frame::NONE.inner_margin(egui::Margin::symmetric(18, 12)).show(ui, |ui| {
+                            egui_commonmark::CommonMarkViewer::new()
+                                .default_implicit_uri_scheme(base)
+                                .show(ui, cache, text);
+                        });
+                    });
+            });
+        if hide {
+            self.docs[self.active].md_preview = false;
+        }
     }
 
     fn welcome(&mut self, ui: &mut Ui) {
