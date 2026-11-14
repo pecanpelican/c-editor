@@ -6,7 +6,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use serde_json::{Value, json};
 
@@ -192,6 +192,20 @@ pub struct CodeAction {
     pub command: Option<Value>,
 }
 
+/// An entry in the call hierarchy (a function), with the call sites that
+/// link it to its parent in the tree.
+#[derive(Clone, Debug)]
+pub struct CallItem {
+    pub name: String,
+    pub detail: String,
+    pub location: Location,
+    /// Call sites (line, character) in the caller's file for incoming calls,
+    /// or in the parent's file for outgoing calls.
+    pub sites: Vec<(u32, u32)>,
+    /// The item as the server sent it, to ask for its calls.
+    pub raw: Value,
+}
+
 /// A symbol from `workspace/symbol`.
 #[derive(Clone, Debug)]
 pub struct Symbol {
@@ -249,6 +263,12 @@ pub enum Event {
     SignatureHelp { req: u64, sig: Option<Signature> },
     CodeActions { actions: Vec<CodeAction>, utf8: bool },
     Symbols { req: u64, symbols: Vec<Symbol>, utf8: bool },
+    /// Answer to `prepareRename`: the symbol's current name, or why it can't be renamed.
+    PrepareRename { req: u64, result: Result<Option<(u32, u32, u32, u32)>, String> },
+    /// References asked for by a refactoring (change signature, safe delete).
+    RefsFor { req: u64, locations: Vec<Location>, utf8: bool },
+    /// Call hierarchy roots or children.
+    Calls { req: u64, items: Vec<CallItem> },
     Status(String),
     Exited(ServerKind, String),
 }
@@ -267,6 +287,10 @@ enum Pending {
     SignatureHelp(u64),
     CodeActions,
     Symbols(u64),
+    PrepareRename(u64),
+    RefsFor(u64),
+    CallPrepare(u64),
+    Calls(u64, bool),
     Other,
     Shutdown,
 }
@@ -274,7 +298,10 @@ enum Pending {
 pub struct Server {
     pub kind: ServerKind,
     child: Child,
-    stdin: Arc<Mutex<ChildStdin>>,
+    /// Messages go to a writer thread, so a big didOpen never blocks the UI
+    /// on a full pipe.
+    writer: mpsc::Sender<Value>,
+    write_failed: Arc<std::sync::atomic::AtomicBool>,
     rx: mpsc::Receiver<Value>,
     next_id: u64,
     pending: HashMap<u64, Pending>,
@@ -282,8 +309,10 @@ pub struct Server {
     pub utf8: bool,
     /// Messages queued until `initialize` completes.
     queue: Vec<Value>,
-    /// path -> version last sent
-    open: HashMap<PathBuf, u64>,
+    /// path -> (version, text) last sent
+    open: HashMap<PathBuf, (u64, String)>,
+    /// The server accepts incremental document changes.
+    incremental: bool,
     sem_legend: Vec<SemKind>,
     /// Diagnostics as the server sent them, for asking about quick fixes.
     raw_diags: HashMap<PathBuf, Vec<Value>>,
@@ -291,6 +320,8 @@ pub struct Server {
     pub supports_formatting: bool,
     pub supports_rename: bool,
     pub supports_references: bool,
+    pub supports_prepare_rename: bool,
+    pub supports_call_hierarchy: bool,
     exited: bool,
 }
 
@@ -335,7 +366,18 @@ impl Server {
             cmd.creation_flags(0x0800_0000);
         }
         let mut child = cmd.spawn()?;
-        let stdin = Arc::new(Mutex::new(child.stdin.take().expect("piped")));
+        let mut stdin: ChildStdin = child.stdin.take().expect("piped");
+        let (writer, wrx) = mpsc::channel::<Value>();
+        let write_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let failed = write_failed.clone();
+        std::thread::spawn(move || {
+            while let Ok(v) = wrx.recv() {
+                if write_message(&mut stdin, &v).is_err() {
+                    failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                    break;
+                }
+            }
+        });
         let stdout = child.stdout.take().expect("piped");
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
@@ -351,7 +393,8 @@ impl Server {
         let mut s = Self {
             kind,
             child,
-            stdin,
+            writer,
+            write_failed,
             rx,
             next_id: 1,
             pending: HashMap::new(),
@@ -365,6 +408,9 @@ impl Server {
             supports_formatting: false,
             supports_rename: false,
             supports_references: false,
+            incremental: false,
+            supports_prepare_rename: false,
+            supports_call_hierarchy: false,
             exited: false,
         };
         let params = json!({
@@ -391,7 +437,8 @@ impl Server {
                         }
                     },
                     "references": {},
-                    "rename": { "prepareSupport": false },
+                    "rename": { "prepareSupport": true },
+                    "callHierarchy": { "dynamicRegistration": false },
                     "formatting": {},
                     "publishDiagnostics": { "relatedInformation": false },
                     "semanticTokens": {
@@ -413,7 +460,7 @@ impl Server {
             }
         }
         let id = s.alloc(Pending::Initialize);
-        s.send_now(&json!({ "jsonrpc": "2.0", "id": id, "method": "initialize", "params": params }));
+        s.send_now(json!({ "jsonrpc": "2.0", "id": id, "method": "initialize", "params": params }));
         Ok(s)
     }
 
@@ -424,17 +471,15 @@ impl Server {
         id
     }
 
-    fn send_now(&mut self, v: &Value) {
-        if let Ok(mut w) = self.stdin.lock()
-            && write_message(&mut *w, v).is_err()
-        {
+    fn send_now(&mut self, v: Value) {
+        if self.writer.send(v).is_err() || self.write_failed.load(std::sync::atomic::Ordering::Relaxed) {
             self.exited = true;
         }
     }
 
     fn send(&mut self, v: Value) {
         if self.ready {
-            self.send_now(&v);
+            self.send_now(v);
         } else {
             self.queue.push(v);
         }
@@ -455,28 +500,44 @@ impl Server {
     }
 
     pub fn sent_version(&self, path: &Path) -> Option<u64> {
-        self.open.get(path).copied()
+        self.open.get(path).map(|o| o.0)
     }
 
-    /// Open or update a document (full text sync).
+    /// Open or update a document. Changes are sent as one replaced range
+    /// when the server supports it, so a keystroke in a 10 MB file sends a
+    /// few bytes instead of the whole file.
     pub fn sync(&mut self, path: &Path, text: &str, version: u64) {
         let uri = path_to_uri(path);
-        match self.open.get(path) {
+        let change = match self.open.get_mut(path) {
             None => {
                 self.notify(
                     "textDocument/didOpen",
                     json!({ "textDocument": { "uri": uri, "languageId": ServerKind::language_id(path), "version": version, "text": text } }),
                 );
+                self.open.insert(path.to_path_buf(), (version, text.to_string()));
+                return;
             }
-            Some(v) if *v == version => return,
-            Some(_) => {
-                self.notify(
-                    "textDocument/didChange",
-                    json!({ "textDocument": { "uri": uri, "version": version }, "contentChanges": [{ "text": text }] }),
-                );
+            Some((v, _)) if *v == version => return,
+            Some((v, old)) => {
+                *v = version;
+                if self.incremental {
+                    let (p, old_end, new_end) = crate::buffer::diff(old, text);
+                    let start = byte_to_position(old, p, self.utf8);
+                    let end = byte_to_position(old, old_end, self.utf8);
+                    let change = json!({
+                        "range": { "start": { "line": start.0, "character": start.1 }, "end": { "line": end.0, "character": end.1 } },
+                        "text": &text[p..new_end],
+                    });
+                    old.replace_range(p..old_end, &text[p..new_end]);
+                    change
+                } else {
+                    old.clear();
+                    old.push_str(text);
+                    json!({ "text": text })
+                }
             }
-        }
-        self.open.insert(path.to_path_buf(), version);
+        };
+        self.notify("textDocument/didChange", json!({ "textDocument": { "uri": uri, "version": version }, "contentChanges": [change] }));
     }
 
     pub fn did_save(&mut self, path: &Path) {
@@ -569,6 +630,29 @@ impl Server {
         self.request("textDocument/rename", p, Pending::Rename);
     }
 
+    /// Can the symbol at `pos` be renamed? Answers with Event::PrepareRename.
+    pub fn prepare_rename(&mut self, path: &Path, pos: (u32, u32), req: u64) {
+        self.request("textDocument/prepareRename", Self::pos(path, pos), Pending::PrepareRename(req));
+    }
+
+    /// References for a refactoring; answers with Event::RefsFor.
+    pub fn references_for(&mut self, path: &Path, pos: (u32, u32), req: u64) {
+        let mut p = Self::pos(path, pos);
+        p["context"] = json!({ "includeDeclaration": true });
+        self.request("textDocument/references", p, Pending::RefsFor(req));
+    }
+
+    /// The call hierarchy item at `pos`; answers with Event::Calls.
+    pub fn prepare_call_hierarchy(&mut self, path: &Path, pos: (u32, u32), req: u64) {
+        self.request("textDocument/prepareCallHierarchy", Self::pos(path, pos), Pending::CallPrepare(req));
+    }
+
+    /// Callers (incoming) or callees (outgoing) of a call hierarchy item.
+    pub fn calls(&mut self, item: &Value, incoming: bool, req: u64) {
+        let method = if incoming { "callHierarchy/incomingCalls" } else { "callHierarchy/outgoingCalls" };
+        self.request(method, json!({ "item": item }), Pending::Calls(req, incoming));
+    }
+
     pub fn format(&mut self, path: &Path, tab_size: u32, spaces: bool) {
         self.request(
             "textDocument/formatting",
@@ -601,8 +685,8 @@ impl Server {
     pub fn shutdown(&mut self) {
         if self.ready && !self.exited {
             let id = self.alloc(Pending::Shutdown);
-            self.send_now(&json!({ "jsonrpc": "2.0", "id": id, "method": "shutdown" }));
-            self.send_now(&json!({ "jsonrpc": "2.0", "method": "exit" }));
+            self.send_now(json!({ "jsonrpc": "2.0", "id": id, "method": "shutdown" }));
+            self.send_now(json!({ "jsonrpc": "2.0", "method": "exit" }));
         }
         let _ = self.child.kill();
     }
@@ -640,7 +724,7 @@ impl Server {
                 _ => Value::Null,
             };
             let reply = json!({ "jsonrpc": "2.0", "id": id.clone(), "result": result });
-            self.send_now(&reply);
+            self.send_now(reply);
             return;
         }
         if let Some(method) = msg.get("method").and_then(Value::as_str) {
@@ -669,9 +753,13 @@ impl Server {
         let Some(p) = self.pending.remove(&id) else { return };
         let result = &msg["result"];
         if msg.get("error").is_some() {
-            if let Pending::Rename = p {
-                let m = msg["error"]["message"].as_str().unwrap_or("rename failed").to_string();
-                out.push(Event::Status(m));
+            let m = msg["error"]["message"].as_str().unwrap_or("request failed").to_string();
+            match p {
+                Pending::Rename => out.push(Event::Status(m)),
+                Pending::PrepareRename(req) => out.push(Event::PrepareRename { req, result: Err(m) }),
+                Pending::RefsFor(req) => out.push(Event::RefsFor { req, locations: Vec::new(), utf8: self.utf8 }),
+                Pending::CallPrepare(req) | Pending::Calls(req, _) => out.push(Event::Calls { req, items: Vec::new() }),
+                _ => {}
             }
             return;
         }
@@ -683,6 +771,10 @@ impl Server {
                 self.supports_formatting = !caps["documentFormattingProvider"].is_null() && caps["documentFormattingProvider"] != false;
                 self.supports_rename = !caps["renameProvider"].is_null() && caps["renameProvider"] != false;
                 self.supports_references = !caps["referencesProvider"].is_null() && caps["referencesProvider"] != false;
+                let sync = &caps["textDocumentSync"];
+                self.incremental = sync.as_u64() == Some(2) || sync["change"].as_u64() == Some(2);
+                self.supports_prepare_rename = caps["renameProvider"]["prepareProvider"] == true;
+                self.supports_call_hierarchy = !caps["callHierarchyProvider"].is_null() && caps["callHierarchyProvider"] != false;
                 if let Some(legend) = caps["semanticTokensProvider"]["legend"]["tokenTypes"].as_array() {
                     self.supports_semantic = !caps["semanticTokensProvider"]["full"].is_null();
                     self.sem_legend = legend
@@ -698,10 +790,10 @@ impl Server {
                         })
                         .collect();
                 }
-                self.send_now(&json!({ "jsonrpc": "2.0", "method": "initialized", "params": {} }));
+                self.send_now(json!({ "jsonrpc": "2.0", "method": "initialized", "params": {} }));
                 self.ready = true;
                 for m in std::mem::take(&mut self.queue) {
-                    self.send_now(&m);
+                    self.send_now(m);
                 }
                 out.push(Event::Status(format!("{} ready", self.kind.name())));
             }
@@ -772,6 +864,40 @@ impl Server {
                     })
                     .unwrap_or_default();
                 out.push(Event::Symbols { req, symbols, utf8: self.utf8 });
+            }
+            Pending::PrepareRename(req) => {
+                // A range, {range, placeholder}, {defaultBehavior}, or null (can't rename).
+                let result = if result.is_null() {
+                    Err("This symbol can't be renamed".to_string())
+                } else if let Some(r) = parse_range(result) {
+                    Ok(Some(r))
+                } else {
+                    Ok(parse_range(&result["range"]))
+                };
+                out.push(Event::PrepareRename { req, result });
+            }
+            Pending::RefsFor(req) => out.push(Event::RefsFor { req, locations: parse_locations(result), utf8: self.utf8 }),
+            Pending::CallPrepare(req) => {
+                let items = result.as_array().map(|a| a.iter().filter_map(|v| parse_call_item(v, &[])).collect()).unwrap_or_default();
+                out.push(Event::Calls { req, items });
+            }
+            Pending::Calls(req, incoming) => {
+                let key = if incoming { "from" } else { "to" };
+                let items = result
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|c| {
+                                let sites: Vec<(u32, u32)> = c["fromRanges"]
+                                    .as_array()
+                                    .map(|rs| rs.iter().filter_map(parse_range).map(|r| (r.0, r.1)).collect())
+                                    .unwrap_or_default();
+                                parse_call_item(&c[key], &sites)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                out.push(Event::Calls { req, items });
             }
             Pending::Other => {}
             Pending::Shutdown => {}
@@ -845,6 +971,18 @@ fn parse_locations(v: &Value) -> Vec<Location> {
         Value::Object(_) => one(v).into_iter().collect(),
         _ => Vec::new(),
     }
+}
+
+fn parse_call_item(v: &Value, sites: &[(u32, u32)]) -> Option<CallItem> {
+    let path = uri_to_path(v["uri"].as_str()?)?;
+    let r = parse_range(&v["selectionRange"]).or_else(|| parse_range(&v["range"]))?;
+    Some(CallItem {
+        name: v["name"].as_str()?.to_string(),
+        detail: v["detail"].as_str().unwrap_or_default().to_string(),
+        location: Location { path, line: r.0, character: r.1 },
+        sites: sites.to_vec(),
+        raw: v.clone(),
+    })
 }
 
 fn parse_text_edit(v: &Value) -> Option<TextEdit> {
@@ -939,28 +1077,65 @@ pub fn apply_edits(text: &mut String, edits: &[TextEdit], utf8: bool) {
     apply_edits_keeping(text, edits, utf8, 0);
 }
 
+/// Byte offsets of line starts, for converting many LSP positions at once.
+pub struct LineStarts(Vec<usize>);
+
+impl LineStarts {
+    pub fn new(text: &str) -> Self {
+        let mut v = vec![0];
+        v.extend(text.bytes().enumerate().filter(|&(_, c)| c == b'\n').map(|(i, _)| i + 1));
+        Self(v)
+    }
+
+    /// Like [`position_to_byte`], in O(line length).
+    pub fn position_to_byte(&self, text: &str, line: u32, character: u32, utf8: bool) -> usize {
+        let Some(&ls) = self.0.get(line as usize) else { return text.len() };
+        let le = self.0.get(line as usize + 1).map_or(text.len(), |&n| n - 1);
+        ls + position_to_byte(&text[ls..le], 0, character, utf8)
+    }
+}
+
 /// Applies the edits and returns where byte `keep` ends up, so the cursor
-/// stays on the same code when lines are added above it.
+/// stays on the same code when lines are added above it. Builds the result
+/// in one pass, so thousands of edits (clang-format on a big file) stay fast.
 pub fn apply_edits_keeping(text: &mut String, edits: &[TextEdit], utf8: bool, keep: usize) -> usize {
-    let mut keep = keep.min(text.len());
+    let keep = keep.min(text.len());
+    let lines = LineStarts::new(text);
     let mut ranges: Vec<(usize, usize, &str)> = edits
         .iter()
         .map(|e| {
-            let s = position_to_byte(text, e.start.0, e.start.1, utf8);
-            let t = position_to_byte(text, e.end.0, e.end.1, utf8);
+            let s = lines.position_to_byte(text, e.start.0, e.start.1, utf8);
+            let t = lines.position_to_byte(text, e.end.0, e.end.1, utf8);
             (s.min(t), t.max(s), e.new_text.as_str())
         })
         .collect();
+    // Same order as applying from the end: by start, then end, descending.
     ranges.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+    ranges.reverse();
+    let mut out = String::with_capacity(text.len() + ranges.iter().map(|r| r.2.len()).sum::<usize>());
+    let mut pos = 0;
+    let mut new_keep = None;
     for (s, e, t) in ranges {
-        if e <= keep {
-            keep = keep - (e - s) + t.len();
-        } else if s < keep {
-            keep = s + t.len();
+        let s = s.max(pos);
+        let e = e.max(s);
+        out.push_str(&text[pos..s]);
+        if new_keep.is_none() {
+            if keep < s {
+                new_keep = Some(out.len() - (s - keep));
+            } else if keep < e {
+                // Inside a replaced range: after it, unless at its very start.
+                new_keep = Some(if keep == s { out.len() } else { out.len() + t.len() });
+            }
         }
-        text.replace_range(s..e, t);
+        out.push_str(t);
+        pos = e;
     }
-    keep
+    if new_keep.is_none() {
+        new_keep = Some(out.len() + keep.saturating_sub(pos));
+    }
+    out.push_str(&text[pos..]);
+    *text = out;
+    new_keep.unwrap_or(0).min(text.len())
 }
 
 // ---------------------------------------------------------------------------

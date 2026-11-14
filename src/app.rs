@@ -10,7 +10,6 @@ use crate::project::{self, FileTree, SearchJob, TreeAction};
 use crate::settings::{Keymap, Settings};
 use crate::theme::Theme;
 
-const DEFAULT_FONT_SIZE: f32 = 14.0;
 
 #[derive(Serialize, Deserialize, Default)]
 struct Session {
@@ -29,6 +28,14 @@ struct Session {
     /// Folders the user said may run their Makefile and debugger setup files.
     #[serde(default)]
     trusted_folders: Vec<PathBuf>,
+    #[serde(default)]
+    recent_files: Vec<PathBuf>,
+    #[serde(default)]
+    recent_commands: Vec<String>,
+    #[serde(default)]
+    bp_settings: Vec<debug_ui::BreakpointSetting>,
+    #[serde(default)]
+    breakpoints_muted: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -62,16 +69,37 @@ enum Modal {
     ConfirmTrash(PathBuf),
     /// Ask before running anything from a folder (see `folder_trusted`).
     TrustFolder(PathBuf),
-    Shortcuts,
+    Shortcuts(ShortcutEditor),
+    Preferences(Box<Settings>),
+    EditBreakpoint { path: PathBuf, line: usize, condition: String, log: String, focus: bool },
     BuildSettings(BuildConfig),
     RenameSymbol { text: String, focus: bool },
+    /// Unsaved edits left by a cedit that quit without saving.
+    Recover(Vec<crate::recovery::Backup>),
+}
+
+/// The keyboard shortcut list, which also rebinds shortcuts.
+#[derive(Default)]
+pub(super) struct ShortcutEditor {
+    filter: String,
+    /// The action waiting for a key press.
+    capturing: Option<crate::settings::Action>,
+    /// A captured shortcut that another action already uses: (action, shortcut, other).
+    conflict: Option<(crate::settings::Action, String, crate::settings::Action)>,
+    /// Remove the shortcut from this action when saving.
+    unbind: Option<crate::settings::Action>,
 }
 
 struct QuickOpen {
     query: String,
-    files: Vec<PathBuf>,
+    files: std::sync::Arc<Vec<PathBuf>>,
     selected: usize,
     focus: bool,
+    /// Ranked (score, index into files), for `ranked_key` = (query, generation).
+    ranked: Vec<(i64, usize)>,
+    ranked_key: Option<(String, u64)>,
+    generation: u64,
+    scanning: bool,
 }
 
 #[derive(Default)]
@@ -89,6 +117,7 @@ pub(crate) enum BottomTab {
     Problems,
     Search,
     References,
+    Calls,
     Terminal,
     Debug,
     Profile,
@@ -132,6 +161,7 @@ pub struct App {
     makefile_key: Option<(PathBuf, Option<PathBuf>)>,
     run_after_build: bool,
     lsp: lsp_ui::LspState,
+    refactor: refactor_ui::RefactorState,
     last_cursor_rect: Option<egui::Rect>,
     settings: Settings,
     keymap: Keymap,
@@ -147,6 +177,14 @@ pub struct App {
     trusted_folders: Vec<PathBuf>,
     /// Folders the user answered "Not Now" for in this run.
     trust_declined: std::collections::HashSet<PathBuf>,
+    palette: Option<palette_ui::Palette>,
+    /// Files opened or switched to, most recent first (Recent Files, Cmd+E).
+    recent_files: Vec<PathBuf>,
+    /// Commands run from the palette, most recent first.
+    recent_commands: Vec<String>,
+    /// Crash recovery: doc id -> version last backed up.
+    backups: std::collections::HashMap<u64, u64>,
+    last_backup: f64,
 }
 
 #[path = "build_ui.rs"]
@@ -159,6 +197,12 @@ mod terminal_ui;
 mod debug_ui;
 #[path = "profile_ui.rs"]
 mod profile_ui;
+#[path = "palette_ui.rs"]
+mod palette_ui;
+#[path = "prefs_ui.rs"]
+mod prefs_ui;
+#[path = "refactor_ui.rs"]
+mod refactor_ui;
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, args: Vec<PathBuf>) -> Self {
@@ -208,6 +252,7 @@ impl App {
             makefile_key: None,
             run_after_build: false,
             lsp: Default::default(),
+            refactor: Default::default(),
             last_cursor_rect: None,
             settings: settings.clone(),
             keymap: Keymap::new(&settings.keybindings).0,
@@ -221,8 +266,21 @@ impl App {
             profile_after_build: false,
             trusted_folders: session.trusted_folders.clone(),
             trust_declined: Default::default(),
+            palette: None,
+            recent_files: session.recent_files.clone(),
+            recent_commands: session.recent_commands.clone(),
+            backups: Default::default(),
+            last_backup: 0.0,
         };
+        app.dbg.load_breakpoint_settings(&session.bp_settings, session.breakpoints_muted);
         app.apply_settings(&cc.egui_ctx, settings, settings_error);
+        if let Some(dir) = crate::recovery::dir() {
+            crate::recovery::heartbeat(&dir);
+            let found = crate::recovery::orphans(&dir);
+            if !found.is_empty() {
+                app.modal = Some(Modal::Recover(found));
+            }
+        }
         app.font_size = session.font_size.unwrap_or(app.settings.font_size);
 
         if args.is_empty() {
@@ -327,7 +385,7 @@ impl App {
 
     /// Show the trust prompt the first time a folder with something to run is opened.
     fn ask_trust_if_needed(&mut self) {
-        if self.modal.is_some() || self.quick_open.is_some() || self.folder_trusted() {
+        if self.modal.is_some() || self.quick_open.is_some() || self.palette.is_some() || self.folder_trusted() {
             return;
         }
         let Some(root) = self.project_root() else { return };
@@ -563,12 +621,20 @@ impl App {
     }
 
     fn cmd_quick_open(&mut self) {
-        let Some(tree) = &self.tree else { return };
+        if self.tree.is_none() {
+            return;
+        }
+        // The file list comes from the tree's background index (picked up
+        // by quick_open_ui on the next frame).
         self.quick_open = Some(QuickOpen {
             query: String::new(),
-            files: project::list_files(&tree.root),
+            files: Default::default(),
             selected: 0,
             focus: true,
+            ranked: Vec::new(),
+            ranked_key: None,
+            generation: u64::MAX,
+            scanning: true,
         });
     }
 
@@ -578,7 +644,7 @@ impl App {
 
     fn find_step_ex(&mut self, ctx: &egui::Context, forward: bool, focus_editor: bool) {
         let Some(doc) = self.docs.get_mut(self.active) else { return };
-        self.find.update(&doc.text);
+        self.find.update(doc);
         let sel = doc.selection(ctx);
         let idx = if forward {
             self.find.next_from(if sel.is_empty() { sel.start } else { sel.start + 1 })
@@ -594,14 +660,14 @@ impl App {
 
     fn replace_one(&mut self, ctx: &egui::Context) {
         let Some(doc) = self.docs.get_mut(self.active) else { return };
-        self.find.update(&doc.text);
+        self.find.update(doc);
         let sel = doc.selection(ctx);
         // If the selection is exactly a match, replace it; then move on.
         if let Some(i) = self.find.matches.iter().position(|m| *m == sel) {
             let m = self.find.matches[i].clone();
             let rep = self.find.replacement.clone();
             doc.replace_range(m, &rep);
-            self.find.update(&doc.text);
+            self.find.update(doc);
             let after = sel.start + rep.len();
             if let Some(n) = self.find.next_from(after) {
                 self.find.current = Some(n);
@@ -615,7 +681,7 @@ impl App {
 
     fn replace_all(&mut self, ctx: &egui::Context) {
         let Some(doc) = self.docs.get_mut(self.active) else { return };
-        self.find.update(&doc.text);
+        self.find.update(doc);
         let n = self.find.matches.len();
         if n == 0 {
             return;
@@ -640,8 +706,27 @@ impl App {
     // ----- input -----------------------------------------------------------
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        use crate::settings::Action as A;
         for action in self.keymap.pressed(ctx, false, self.terms.focused) {
+            self.run_action(ctx, action);
+        }
+        // Extra fixed aliases.
+        let cmd = Modifiers::COMMAND;
+        if ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(cmd | Modifiers::SHIFT, Key::G))) {
+            self.find_step(ctx, false);
+        }
+        if ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(cmd, Key::G))) && !self.find.query.is_empty() {
+            self.find_step(ctx, true);
+        }
+        if ctx.input(|i| i.key_pressed(Key::Escape)) && self.find.open && self.modal.is_none() && !self.terms.focused {
+            self.find.open = false;
+            self.focus_active();
+        }
+    }
+
+    /// Run a keymap action, from a shortcut, a menu or the command palette.
+    pub(super) fn run_action(&mut self, ctx: &egui::Context, action: crate::settings::Action) {
+        use crate::settings::Action as A;
+        {
             match action {
                 A::Save => {
                     self.save_doc(ctx, self.active);
@@ -695,6 +780,13 @@ impl App {
                 A::QuickFix => self.cmd_quick_fix(ctx),
                 A::FindReferences => self.cmd_references(ctx),
                 A::Rename => self.cmd_rename(ctx),
+                A::RefactorThis => self.cmd_refactor_this(ctx),
+                A::ExtractVariable => self.cmd_extract_variable(ctx),
+                A::ExtractFunction => self.cmd_extract_function(ctx),
+                A::InlineVariable => self.cmd_inline_variable(ctx),
+                A::ChangeSignature => self.cmd_change_signature(ctx),
+                A::SafeDelete => self.cmd_safe_delete(ctx),
+                A::CallHierarchy => self.cmd_call_hierarchy(ctx),
                 A::Format => self.cmd_format(ctx),
                 A::SwitchHeader => self.cmd_switch_header(ctx),
                 A::Back => self.nav_back(),
@@ -714,24 +806,27 @@ impl App {
                 A::StepInto => self.debug_step("stepIn"),
                 A::StepOut => self.debug_step("stepOut"),
                 A::Profile => self.cmd_profile(ctx),
-                A::ToggleComment | A::DuplicateLine | A::DeleteLine => {}
+                A::CommandPalette => self.open_palette(),
+                A::RecentFiles => self.open_recent_files(),
+                A::ToggleComment | A::DuplicateLine | A::DeleteLine | A::MoveLineUp | A::MoveLineDown => {
+                    // Normally handled by the focused editor; from a menu or
+                    // the palette, hand it to the active document.
+                    if let Some(d) = self.docs.get_mut(self.active)
+                        && d.viewer.is_none()
+                    {
+                        d.pending_action = Some(action);
+                        d.focus();
+                    }
+                }
             }
-        }
-        // Extra fixed aliases.
-        let cmd = Modifiers::COMMAND;
-        if ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(cmd | Modifiers::SHIFT, Key::G))) {
-            self.find_step(ctx, false);
-        }
-        if ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(cmd, Key::G))) && !self.find.query.is_empty() {
-            self.find_step(ctx, true);
-        }
-        if ctx.input(|i| i.key_pressed(Key::Escape)) && self.find.open && self.modal.is_none() && !self.terms.focused {
-            self.find.open = false;
-            self.focus_active();
         }
     }
 
-    fn cmd_open_settings(&mut self, ctx: &egui::Context) {
+    fn cmd_open_settings(&mut self, _ctx: &egui::Context) {
+        self.modal = Some(Modal::Preferences(Box::new(self.settings.clone())));
+    }
+
+    pub(super) fn cmd_open_settings_json(&mut self, ctx: &egui::Context) {
         let _ = Settings::load(); // creates the file with defaults if missing
         match crate::settings::settings_path() {
             Some(p) if p.is_file() => {
@@ -745,8 +840,9 @@ impl App {
     /// Apply loaded settings (theme, font, tab size, keymap).
     fn apply_settings(&mut self, ctx: &egui::Context, s: Settings, error: Option<String>) {
         let font_changed = s.font_path != self.settings.font_path || self.fonts_loaded.is_none();
-        self.theme = if s.theme.eq_ignore_ascii_case("light") { Theme::light() } else { Theme::dark() };
+        self.theme = Theme::by_name(&s.theme, ctx.system_theme().map(|t| t == egui::Theme::Dark));
         self.theme.apply(ctx);
+        crate::textops::set_auto_close(s.auto_close_brackets);
         if (s.font_size - self.settings.font_size).abs() > 0.01 {
             self.font_size = s.font_size;
         }
@@ -781,6 +877,57 @@ impl App {
         }
     }
 
+    /// Copy unsaved edits to the recovery folder every few seconds.
+    fn backup_unsaved(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|i| i.time);
+        if now - self.last_backup < 3.0 {
+            return;
+        }
+        self.last_backup = now;
+        let Some(dir) = crate::recovery::dir() else { return };
+        crate::recovery::heartbeat(&dir);
+        let mut keep = std::collections::HashSet::new();
+        for d in &self.docs {
+            if !d.dirty || d.viewer.is_some() {
+                continue;
+            }
+            keep.insert(d.id);
+            if self.backups.get(&d.id) != Some(&d.version)
+                && crate::recovery::write(&dir, d.id, d.path.as_deref(), &d.text).is_ok()
+            {
+                self.backups.insert(d.id, d.version);
+            }
+        }
+        let gone: Vec<u64> = self.backups.keys().filter(|id| !keep.contains(id)).copied().collect();
+        for id in gone {
+            self.backups.remove(&id);
+            let _ = std::fs::remove_file(dir.join(format!("{}-{id}.json", std::process::id())));
+        }
+    }
+
+    fn restore_backups(&mut self, backups: &[crate::recovery::Backup]) {
+        for b in backups {
+            match &b.path {
+                Some(p) if p.is_file() => {
+                    if self.open_file_quiet(p)
+                        && let Some(d) = self.docs.get_mut(self.active)
+                    {
+                        d.text = b.text.clone();
+                        d.mark_changed();
+                    }
+                }
+                // Untitled, or the file was deleted since: a new tab.
+                _ => {
+                    let mut d = Document::new_untitled();
+                    d.text = b.text.clone();
+                    d.mark_changed();
+                    self.docs.push(d);
+                    self.active = self.docs.len() - 1;
+                }
+            }
+        }
+    }
+
     fn focus_active(&mut self) {
         if let Some(d) = self.docs.get_mut(self.active) {
             d.focus();
@@ -801,11 +948,23 @@ impl eframe::App for App {
             breakpoints: self.dbg.breakpoints.clone(),
             watches: self.dbg.watches.clone(),
             trusted_folders: self.trusted_folders.clone(),
+            recent_files: self.recent_files.clone(),
+            recent_commands: self.recent_commands.clone(),
+            bp_settings: self.dbg.breakpoint_settings(),
+            breakpoints_muted: self.dbg.muted,
         };
         eframe::set_value(storage, "session", &session);
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        let t0 = std::time::Instant::now();
+        self.ui_frame(ui);
+        crate::perf::frame_done(ui.ctx(), t0);
+    }
+}
+
+impl App {
+    fn ui_frame(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
 
         // Unsaved changes on quit.
@@ -816,6 +975,15 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.modal = Some(Modal::UnsavedQuit);
         }
+
+        // A normal quit: nothing to recover next time.
+        if ctx.input(|i| i.viewport().close_requested())
+            && (self.quit_confirmed || !self.docs.iter().any(|d| d.dirty))
+            && let Some(dir) = crate::recovery::dir()
+        {
+            crate::recovery::clear_own(&dir);
+        }
+        self.backup_unsaved(&ctx);
 
         // Dropped files and folders.
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
@@ -839,6 +1007,16 @@ impl eframe::App for App {
             for d in &mut self.docs {
                 d.check_disk();
             }
+            if self.settings.theme.eq_ignore_ascii_case("system") {
+                let sys_dark = ctx.system_theme().map(|t| t == egui::Theme::Dark);
+                if sys_dark.is_some_and(|d| d != self.theme.dark) {
+                    self.theme = crate::theme::Theme::by_name("system", sys_dark);
+                    self.theme.apply(&ctx);
+                    for d in &mut self.docs {
+                        d.invalidate_layout();
+                    }
+                }
+            }
             let m = Settings::mtime();
             if m != self.settings_mtime {
                 self.settings_mtime = m;
@@ -856,8 +1034,13 @@ impl eframe::App for App {
         self.update_terminals(&ctx);
         self.update_debug(&ctx);
         self.update_profile(&ctx);
-        if self.modal.is_none() && self.quick_open.is_none() {
+        if self.modal.is_none() && self.quick_open.is_none() && self.palette.is_none() {
             self.handle_shortcuts(&ctx);
+        }
+        if let Some(p) = self.docs.get(self.active).and_then(|d| d.path.clone())
+            && self.recent_files.first() != Some(&p)
+        {
+            self.note_recent_file(&p);
         }
 
         self.update_title(&ctx);
@@ -894,7 +1077,9 @@ impl eframe::App for App {
         }
         self.debug_hover_ui(&ctx);
         self.quick_open_ui(&ctx);
+        self.palette_ui(&ctx);
         self.goto_line_ui(&ctx);
+        self.refactor_ui(&ctx);
         self.modal_ui(&ctx);
         self.toasts_ui(&ctx);
     }
@@ -1047,11 +1232,18 @@ impl App {
                     self.cmd_find_in_files(&ctx);
                 }
                 ui.separator();
-                ui.label(RichText::new("In the editor:").weak());
-                ui.add(egui::Button::new("Toggle Comment").shortcut_text(self.keymap.label(&ctx, crate::settings::Action::ToggleComment)));
-                ui.add(egui::Button::new("Duplicate Line").shortcut_text(self.keymap.label(&ctx, crate::settings::Action::DuplicateLine)));
-                ui.add(egui::Button::new("Delete Line").shortcut_text(self.keymap.label(&ctx, crate::settings::Action::DeleteLine)));
-                ui.add(egui::Button::new("Indent / Unindent").shortcut_text("Tab / Shift+Tab"));
+                use crate::settings::Action as A;
+                let editing = self.docs.get(self.active).is_some_and(|d| d.viewer.is_none());
+                for a in [A::ToggleComment, A::DuplicateLine, A::DeleteLine, A::MoveLineUp, A::MoveLineDown] {
+                    if ui.add_enabled(editing, egui::Button::new(a.title()).shortcut_text(self.keymap.label(&ctx, a))).clicked() {
+                        self.run_action(&ctx, a);
+                    }
+                }
+                ui.add_enabled(false, egui::Button::new("Indent / Unindent").shortcut_text("Tab / Shift+Tab"));
+                ui.separator();
+                if ui.add(egui::Button::new("Command Palette…").shortcut_text(self.keymap.label(&ctx, A::CommandPalette))).clicked() {
+                    self.open_palette();
+                }
             });
             ui.menu_button("Go", |ui| {
                 if ui.add_enabled(self.tree.is_some(), egui::Button::new("Go to File…").shortcut_text(self.keymap.label(&ctx, crate::settings::Action::GotoFile))).clicked() {
@@ -1060,13 +1252,24 @@ impl App {
                 if ui.add_enabled(!self.docs.is_empty(), egui::Button::new("Go to Line…").shortcut_text(self.keymap.label(&ctx, crate::settings::Action::GotoLine))).clicked() {
                     self.goto_line = Some((String::new(), true));
                 }
+                if ui.add(egui::Button::new("Recent Files…").shortcut_text(self.keymap.label(&ctx, crate::settings::Action::RecentFiles))).clicked() {
+                    self.open_recent_files();
+                }
+                if ui.add_enabled(self.tree.is_some(), egui::Button::new("Go to Symbol…").shortcut_text(self.keymap.label(&ctx, crate::settings::Action::GotoSymbol))).clicked() {
+                    self.cmd_goto_symbol(&ctx);
+                }
                 ui.separator();
-                if ui.add(egui::Button::new("Next Tab").shortcut_text(self.keymap.label(&ctx, crate::settings::Action::NextTab))).clicked() && !self.docs.is_empty() {
-                    self.active = (self.active + 1) % self.docs.len();
+                use crate::settings::Action as A;
+                for a in [A::NextTab, A::PrevTab, A::Back, A::NextProblem, A::PrevProblem] {
+                    if ui.add(egui::Button::new(a.title()).shortcut_text(self.keymap.label(&ctx, a))).clicked() {
+                        self.run_action(&ctx, a);
+                    }
                 }
             });
             self.code_menu(ui);
+            self.refactor_menu(ui);
             self.build_menu(ui);
+            self.debug_menu(ui);
             ui.menu_button("View", |ui| {
                 let md = self.docs.get(self.active).and_then(|d| d.is_markdown().then_some(d.md_preview));
                 if ui.add_enabled(md.is_some(), egui::Button::selectable(md == Some(true), "Markdown Preview")).clicked()
@@ -1095,12 +1298,23 @@ impl App {
                     self.zoom(-1.0);
                 }
                 if ui.add(egui::Button::new("Reset Zoom").shortcut_text(self.keymap.label(&ctx, crate::settings::Action::ZoomReset))).clicked() {
-                    self.font_size = DEFAULT_FONT_SIZE;
+                    self.font_size = self.settings.font_size;
                 }
+                ui.separator();
+                ui.menu_button("Theme", |ui| {
+                    for (id, name) in crate::theme::Theme::NAMES {
+                        if ui.add(egui::Button::selectable(self.settings.theme.eq_ignore_ascii_case(id), *name)).clicked() {
+                            self.set_theme(&ctx, id);
+                        }
+                    }
+                });
             });
             ui.menu_button("Help", |ui| {
+                if ui.add(egui::Button::new("Command Palette…").shortcut_text(self.keymap.label(&ctx, crate::settings::Action::CommandPalette))).clicked() {
+                    self.open_palette();
+                }
                 if ui.button("Keyboard Shortcuts").clicked() {
-                    self.modal = Some(Modal::Shortcuts);
+                    self.open_shortcuts();
                 }
             });
             self.build_toolbar(ui);
@@ -1136,6 +1350,7 @@ impl App {
         let md = d.is_markdown().then_some(d.md_preview);
         let lang = if md.is_some() { "Markdown" } else { d.lang.name() };
         let crlf = d.crlf;
+        let hard_tabs = d.lang.uses_hard_tabs();
         let (l, c) = d.cursor_line_col;
         let sel = d.selection_chars;
         ui.horizontal_centered(|ui| {
@@ -1154,12 +1369,26 @@ impl App {
                     ui.label(RichText::new(t).color(self.theme.warning));
                     ui.separator();
                 }
-                ui.label(if crlf { "CRLF" } else { "LF" });
+                let flat = |ui: &mut Ui, text: String, tip: &str| {
+                    ui.add(egui::Button::new(text).frame(false)).on_hover_text(tip).clicked()
+                };
+                if flat(ui, (if crlf { "CRLF" } else { "LF" }).into(), "Line endings: click to switch") {
+                    let d = &mut self.docs[self.active];
+                    d.crlf = !d.crlf;
+                    d.dirty = true;
+                }
+                ui.separator();
+                let indent = if hard_tabs { "Tabs".to_string() } else { format!("Spaces: {}", self.settings.tab_size) };
+                if flat(ui, indent, "Indentation: click to change in Settings") {
+                    self.modal = Some(Modal::Preferences(Box::new(self.settings.clone())));
+                }
                 ui.separator();
                 if sel > 0 {
                     ui.label(format!("{sel} chars"));
                 }
-                ui.label(format!("Ln {}, Col {}", l + 1, c + 1));
+                if flat(ui, format!("Ln {}, Col {}", l + 1, c + 1), "Go to line") {
+                    self.goto_line = Some((String::new(), true));
+                }
             });
         });
     }
@@ -1333,7 +1562,7 @@ impl App {
 
         let doc = &mut self.docs[self.active];
         if self.find.open {
-            self.find.update(&doc.text);
+            self.find.update(doc);
         }
         let doc_path = doc.path.clone();
         let _ = doc;
@@ -1352,8 +1581,14 @@ impl App {
         let mut marks = self.debug_marks(doc_path.as_deref());
         marks.heat = self.profile_heat(doc_path.as_deref());
         let doc = &mut self.docs[self.active];
-        let out = editor::show(ui, doc, &self.find, &theme, self.font_size, &diags, &self.keymap, &marks);
-        self.track_breakpoint_lines();
+        let out = {
+            let _t = crate::perf::scope("editor::show");
+            editor::show(ui, doc, &self.find, &theme, self.font_size, &diags, &self.keymap, &marks)
+        };
+        {
+            let _t = crate::perf::scope("track_breakpoint_lines");
+            self.track_breakpoint_lines();
+        }
         if let (Some(line), Some(p)) = (out.gutter_click, doc_path.as_ref()) {
             self.toggle_breakpoint(p, line);
         }
@@ -1362,6 +1597,7 @@ impl App {
         if !out.typed.is_empty()
             && let Some(c) = out.cursor
         {
+            let _t = crate::perf::scope("on_typed");
             self.on_typed(&ctx, &out.typed, c, false);
         } else if let (Some(c), Some(comp)) = (out.cursor, &self.lsp.completion) {
             // Cursor moved away from the word being completed.
@@ -1454,16 +1690,35 @@ impl App {
                 ui.add_space(16.0);
                 ui.label(RichText::new("Recent").weak());
                 for r in self.recent_folders.clone() {
-                    if ui.link(r.display().to_string()).clicked() && r.is_dir() {
+                    let name = r.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| r.display().to_string());
+                    let exists = r.is_dir();
+                    let link = ui.add_enabled(exists, egui::Link::new(name)).on_hover_text(r.display().to_string());
+                    if link.clicked() {
                         self.open_folder(r);
                     }
                 }
             }
+            // A few shortcuts worth knowing.
+            ui.add_space(20.0);
+            use crate::settings::Action as A;
+            let mut tips = vec![A::CommandPalette, A::RecentFiles];
             if self.tree.is_some() {
-                ui.add_space(16.0);
-                let sc = ui.ctx().format_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::P));
-                ui.label(RichText::new(format!("Press {sc} to jump to any file")).weak());
+                tips.extend([A::GotoFile, A::GotoSymbol, A::FindInFiles, A::Build]);
             }
+            let ctx = ui.ctx().clone();
+            egui::Grid::new("welcome-tips").num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
+                for a in tips {
+                    let k = self.keymap.label(&ctx, a);
+                    if k.is_empty() {
+                        continue;
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(RichText::new(a.title().trim_end_matches('…')).weak());
+                    });
+                    ui.label(RichText::new(k).monospace().color(self.theme.gutter_current_fg));
+                    ui.end_row();
+                }
+            });
         });
     }
 
@@ -1566,6 +1821,7 @@ impl App {
             ui.selectable_value(&mut self.bottom_tab, BottomTab::Problems, label);
             ui.selectable_value(&mut self.bottom_tab, BottomTab::Search, "Find in Files");
             ui.selectable_value(&mut self.bottom_tab, BottomTab::References, "References");
+            ui.selectable_value(&mut self.bottom_tab, BottomTab::Calls, "Call Hierarchy");
             if ui.selectable_value(&mut self.bottom_tab, BottomTab::Terminal, "Terminal").clicked() {
                 self.show_terminal(ui.ctx());
             }
@@ -1594,6 +1850,7 @@ impl App {
             BottomTab::Problems => self.problems_panel(ui),
             BottomTab::Search => self.search_panel(ui),
             BottomTab::References => self.references_panel(ui),
+            BottomTab::Calls => self.calls_panel(ui),
             BottomTab::Terminal => self.terminal_panel(ui),
             BottomTab::Debug => self.debug_panel(ui),
             BottomTab::Profile => self.profile_panel(ui),
@@ -1683,18 +1940,36 @@ impl App {
 
     fn quick_open_ui(&mut self, ctx: &egui::Context) {
         let Some(qo) = &mut self.quick_open else { return };
+        // Pick up a newer file list from the background scan.
+        if let Some(tree) = &mut self.tree {
+            let (files, generation, scanning) = tree.all_files(ctx);
+            qo.scanning = scanning;
+            if generation != qo.generation {
+                qo.files = files;
+                qo.generation = generation;
+            }
+        }
         let mut chosen: Option<PathBuf> = None;
         let mut close = false;
-        let mut ranked: Vec<(i64, &PathBuf)> = qo
-            .files
-            .iter()
-            .filter_map(|f| {
-                let s = f.to_string_lossy();
-                project::fuzzy_score(&s, &qo.query).map(|sc| (sc, f))
-            })
-            .collect();
-        ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
-        ranked.truncate(200);
+        // Rank only when the query or the file list changed.
+        let key = (qo.query.clone(), qo.generation);
+        if qo.ranked_key.as_ref() != Some(&key) {
+            let files = &qo.files;
+            let mut r: Vec<(i64, usize)> = files
+                .iter()
+                .enumerate()
+                .filter_map(|(i, f)| project::fuzzy_score(&f.to_string_lossy(), &qo.query).map(|sc| (sc, i)))
+                .collect();
+            let n = r.len().min(200);
+            if r.len() > n {
+                r.select_nth_unstable_by(n - 1, |a, b| b.0.cmp(&a.0).then_with(|| files[a.1].cmp(&files[b.1])));
+                r.truncate(n);
+            }
+            r.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| files[a.1].cmp(&files[b.1])));
+            qo.ranked = r;
+            qo.ranked_key = Some(key);
+        }
+        let ranked: Vec<(i64, &PathBuf)> = qo.ranked.iter().map(|&(sc, i)| (sc, &qo.files[i])).collect();
         if !ranked.is_empty() {
             qo.selected = qo.selected.min(ranked.len() - 1);
         }
@@ -1743,7 +2018,8 @@ impl App {
                     }
                 }
                 if ranked.is_empty() {
-                    ui.label(RichText::new("No matching files").weak());
+                    let msg = if qo.scanning { "Listing files…" } else { "No matching files" };
+                    ui.label(RichText::new(msg).weak());
                 }
             });
         });
@@ -1995,6 +2271,10 @@ impl App {
                             if let Some(t) = &mut self.tree {
                                 t.refresh();
                             }
+                            if matches!(kind, NameKind::Rename) {
+                                let np = target.with_file_name(&name);
+                                self.after_file_renamed(&target, &np);
+                            }
                             if let Some(p) = open {
                                 self.open_file(&p);
                                 self.focus_active();
@@ -2085,6 +2365,42 @@ impl App {
                 }
             }
             Modal::BuildSettings(cfg) => self.build_settings_modal(ctx, cfg),
+            Modal::Recover(backups) => {
+                let mut choice = None;
+                egui::Modal::new(egui::Id::unique("recover")).show(ctx, |ui| {
+                    ui.set_width(480.0);
+                    ui.heading("Restore unsaved changes?");
+                    ui.label("cedit closed without saving these files last time:");
+                    ui.add_space(4.0);
+                    egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
+                        for b in &backups {
+                            let name = b.path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "untitled".into());
+                            let lines = b.text.lines().count();
+                            ui.label(RichText::new(format!("{name}  ({lines} lines)")).monospace());
+                        }
+                    });
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button(RichText::new("Restore").strong()).clicked() {
+                            choice = Some(true);
+                        }
+                        if ui.button("Discard").clicked() {
+                            choice = Some(false);
+                        }
+                    });
+                });
+                match choice {
+                    Some(restore) => {
+                        if restore {
+                            self.restore_backups(&backups);
+                        }
+                        if let Some(dir) = crate::recovery::dir() {
+                            crate::recovery::discard(&dir, &backups);
+                        }
+                    }
+                    None => self.modal = Some(Modal::Recover(backups)),
+                }
+            }
             Modal::RenameSymbol { mut text, mut focus } => {
                 let mut submit = false;
                 let mut cancel = false;
@@ -2109,42 +2425,21 @@ impl App {
                 });
                 let name = text.trim().to_string();
                 if submit && !name.is_empty() {
-                    self.do_rename(ctx, name);
-                    self.focus_active();
+                    if self.do_rename(ctx, name) {
+                        self.focus_active();
+                    } else {
+                        self.modal = Some(Modal::RenameSymbol { text, focus: true });
+                    }
                 } else if cancel {
                     self.focus_active();
                 } else {
                     self.modal = Some(Modal::RenameSymbol { text, focus });
                 }
             }
-            Modal::Shortcuts => {
-                let mut close = false;
-                let mut rows: Vec<(String, String)> = crate::settings::Action::ALL
-                    .iter()
-                    .map(|a| (self.keymap.label(ctx, *a), a.id().replace('_', " ")))
-                    .filter(|(k, _)| !k.is_empty())
-                    .collect();
-                rows.push(("Tab / Shift+Tab".into(), "indent / unindent".into()));
-                rows.push(("Cmd/Ctrl+click".into(), "go to definition".into()));
-                egui::Modal::new(egui::Id::unique("shortcuts")).show(ctx, |ui| {
-                    ui.heading("Keyboard shortcuts");
-                    ui.label(RichText::new("Change these under \"keybindings\" in File → Settings.").weak());
-                    egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
-                        egui::Grid::new("sc-grid").num_columns(2).spacing([24.0, 4.0]).show(ui, |ui| {
-                            for (k, d) in &rows {
-                                ui.monospace(k);
-                                ui.label(d);
-                                ui.end_row();
-                            }
-                        });
-                    });
-                    if ui.button("Close").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
-                        close = true;
-                    }
-                });
-                if !close {
-                    self.modal = Some(Modal::Shortcuts);
-                }
+            Modal::Shortcuts(ed) => self.shortcuts_modal(ctx, ed),
+            Modal::Preferences(draft) => self.preferences_modal(ctx, *draft),
+            Modal::EditBreakpoint { path, line, condition, log, focus } => {
+                self.edit_breakpoint_modal(ctx, path, line, condition, log, focus)
             }
         }
     }

@@ -1,18 +1,15 @@
 //! An open document and the code-editor widget that shows it.
 
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use egui::text::{CCursor, CCursorRange};
-use egui::{
-    Align, Align2, Event, FontId, Galley, Id, Key, Modifiers, Rect, ScrollArea, Sense, Shape,
-    TextBuffer, TextEdit, Ui, Vec2, pos2, vec2,
-};
+use egui::text::CCursor;
+use egui::{Align, Align2, Event, FontId, Galley, Id, Key, Modifiers, Rect, ScrollArea, Sense, Shape, Ui, pos2, vec2};
 
-use crate::find::{FindState, hash_text};
+use crate::buffer::{Record, TextIndex};
+use crate::find::FindState;
 use crate::highlight::{self, Language};
 use crate::textops;
 use crate::theme::Theme;
@@ -49,12 +46,33 @@ pub struct Document {
     pub selection_chars: usize,
     /// Cursor byte offset as of the last frame.
     pub cursor_byte: usize,
-    galley_cache: Option<(u64, Arc<Galley>)>,
-    last_cursor: Option<(usize, usize, usize)>,
+    /// Selection: `anchor` is where it started, `head` is the caret (byte offsets).
+    anchor: usize,
+    head: usize,
+    /// Selection when the text was last synced (the "before" of an undo step).
+    synced_sel: (usize, usize),
+    /// Preferred x for moving the caret up and down (pixels from line start).
+    desired_x: Option<f32>,
+    /// Line index, lexer states and undo history.
+    pub index: TextIndex,
+    /// IME composition in progress.
+    preedit: String,
+    /// When the caret last moved (it stays solid while moving).
+    caret_time: f64,
+    /// Scroll the caret into view on the next frame (centered if true).
+    scroll_to_caret: Option<bool>,
+    /// Mouse drag in progress: select by char (1), word (2) or line (3).
+    drag_unit: u8,
+    /// (version, head) -> matching bracket pair, cached.
+    bracket_cache: Option<((u64, usize), Option<(usize, usize)>)>,
+    last_head: Option<(usize, usize, u64)>,
     /// Images and PDFs open in a read-only viewer instead of the text editor.
     pub viewer: Option<Viewer>,
     /// Markdown files: show the rendered preview beside the editor.
     pub md_preview: bool,
+    /// An editor command (toggle comment, move line...) chosen from a menu or
+    /// the command palette, applied on the next frame.
+    pub pending_action: Option<crate::settings::Action>,
 }
 
 pub enum OpenError {
@@ -136,10 +154,20 @@ impl Document {
             cursor_line_col: (0, 0),
             selection_chars: 0,
             cursor_byte: 0,
-            galley_cache: None,
-            last_cursor: None,
+            anchor: 0,
+            head: 0,
+            synced_sel: (0, 0),
+            desired_x: None,
+            index: TextIndex::default(),
+            preedit: String::new(),
+            caret_time: 0.0,
+            scroll_to_caret: None,
+            drag_unit: 0,
+            bracket_cache: None,
+            last_head: None,
             viewer: None,
             md_preview: true,
+            pending_action: None,
         }
     }
 
@@ -162,8 +190,87 @@ impl Document {
         Id::unique(("cedit-editor", self.id))
     }
 
-    pub fn invalidate_layout(&mut self) {
-        self.galley_cache = None;
+    /// Layout is computed per frame for the visible lines only; kept for callers
+    /// that used to drop a cached whole-file layout.
+    pub fn invalidate_layout(&mut self) {}
+
+    /// Bring the line index, lexer states and undo history up to date with
+    /// `text` (cheap when nothing changed).
+    pub fn sync(&mut self) {
+        self.sync_as(Record::Edit);
+    }
+
+    fn sync_as(&mut self, record: Record) {
+        let before = self.synced_sel;
+        self.index.sync(&self.text, self.version, before, record);
+        self.clamp_selection();
+        self.synced_sel = (self.anchor, self.head);
+    }
+
+    fn clamp_selection(&mut self) {
+        let len = self.text.len();
+        self.anchor = textops::floor_char_boundary(&self.text, self.anchor.min(len));
+        self.head = textops::floor_char_boundary(&self.text, self.head.min(len));
+    }
+
+    /// Set the selection (byte offsets; `head` is where the caret goes).
+    pub fn set_selection(&mut self, sel: Range<usize>) {
+        self.anchor = sel.start;
+        self.head = sel.end;
+        self.clamp_selection();
+        self.desired_x = None;
+        self.index.seal();
+    }
+
+    /// Replace `range` with `with`, put the caret after it and record undo.
+    pub fn edit(&mut self, range: Range<usize>, with: &str) {
+        self.sync();
+        self.text.replace_range(range.clone(), with);
+        self.version += 1;
+        let c = range.start + with.len();
+        self.anchor = c;
+        self.head = c;
+        self.desired_x = None;
+        self.sync();
+        self.dirty = self.text.len() != self.saved.len() || self.text != self.saved;
+        self.scroll_to_caret.get_or_insert(false);
+    }
+
+    pub fn undo(&mut self) {
+        self.sync();
+        let Some(r) = self.index.pop_undo() else { return };
+        let end = (r.at + r.inserted.len()).min(self.text.len());
+        if !self.text.is_char_boundary(r.at) || !self.text.is_char_boundary(end) {
+            return;
+        }
+        self.text.replace_range(r.at..end, &r.removed);
+        self.version += 1;
+        self.anchor = r.sel_before.0;
+        self.head = r.sel_before.1;
+        if self.anchor == self.head && self.head != r.at + r.removed.len() && self.head != r.at {
+            self.anchor = r.at + r.removed.len();
+            self.head = self.anchor;
+        }
+        self.sync_as(Record::Undo);
+        self.dirty = self.text != self.saved;
+        self.scroll_to_caret = Some(false);
+    }
+
+    pub fn redo(&mut self) {
+        self.sync();
+        let Some(r) = self.index.pop_redo() else { return };
+        let end = (r.at + r.inserted.len()).min(self.text.len());
+        if !self.text.is_char_boundary(r.at) || !self.text.is_char_boundary(end) {
+            return;
+        }
+        self.text.replace_range(r.at..end, &r.removed);
+        self.version += 1;
+        let c = r.at + r.removed.len();
+        self.anchor = c;
+        self.head = c;
+        self.sync_as(Record::Redo);
+        self.dirty = self.text != self.saved;
+        self.scroll_to_caret = Some(false);
     }
 
     pub fn mark_changed(&mut self) {
@@ -212,7 +319,6 @@ impl Document {
         }
         self.lang = Language::from_path(&path);
         self.path = Some(path);
-        self.galley_cache = None;
         self.semantic.clear();
         self.save()
     }
@@ -271,17 +377,17 @@ impl Document {
     }
 
     pub fn line_count(&self) -> usize {
+        if self.index.is_fresh(&self.text, self.version) {
+            return self.index.line_count();
+        }
         self.text.bytes().filter(|&b| b == b'\n').count() + 1
     }
 
-    /// Current selection as a sorted byte range, read from the widget state.
-    pub fn selection(&self, ctx: &egui::Context) -> Range<usize> {
-        let state = TextEdit::load_state(ctx, self.text_edit_id());
-        let Some(range) = state.and_then(|s| s.cursor.char_range()) else {
-            return 0..0;
-        };
-        let r = range.as_sorted_char_range();
-        textops::char_to_byte(&self.text, r.start.0)..textops::char_to_byte(&self.text, r.end.0)
+    /// Current selection as a sorted byte range.
+    pub fn selection(&self, _ctx: &egui::Context) -> Range<usize> {
+        let len = self.text.len();
+        let (a, h) = (self.anchor.min(len), self.head.min(len));
+        a.min(h)..a.max(h)
     }
 
     pub fn selected_text(&self, ctx: &egui::Context) -> String {
@@ -289,15 +395,9 @@ impl Document {
         self.text[s].to_string()
     }
 
-    fn set_selection_now(&self, ctx: &egui::Context, sel: Range<usize>) {
-        let id = self.text_edit_id();
-        let mut state = TextEdit::load_state(ctx, id).unwrap_or_default();
-        let a = textops::byte_to_char(&self.text, sel.start);
-        let b = textops::byte_to_char(&self.text, sel.end);
-        state
-            .cursor
-            .set_char_range(Some(CCursorRange::two(CCursor::new(a), CCursor::new(b))));
-        TextEdit::store_state(ctx, id, state);
+    fn set_selection_now(&mut self, _ctx: &egui::Context, sel: Range<usize>) {
+        self.set_selection(sel);
+        self.scroll_to_caret.get_or_insert(false);
     }
 
     /// Replace the given byte range and leave the cursor after it.
@@ -356,8 +456,25 @@ fn handle_keys(ui: &mut Ui, doc: &mut Document, keymap: &crate::settings::Keymap
         Duplicate,
         DeleteLine,
         Closing(char),
+        MoveUp,
+        MoveDown,
+        Open(char),
+        Backspace,
     }
-    let action = ctx.input_mut(|i| {
+    // A command picked from a menu or the command palette.
+    let pending = doc.pending_action.take().and_then(|a| {
+        use crate::settings::Action as A;
+        match a {
+            A::ToggleComment => Some(Action::Comment),
+            A::DuplicateLine => Some(Action::Duplicate),
+            A::DeleteLine => Some(Action::DeleteLine),
+            A::MoveLineUp => Some(Action::MoveUp),
+            A::MoveLineDown => Some(Action::MoveDown),
+            _ => None,
+        }
+    });
+    let auto_close = textops::auto_close_enabled();
+    let action = pending.or_else(|| ctx.input_mut(|i| {
         if i.consume_key(Modifiers::SHIFT, Key::Tab) {
             return Some(Action::Dedent);
         }
@@ -378,20 +495,37 @@ fn handle_keys(ui: &mut Ui, doc: &mut Document, keymap: &crate::settings::Keymap
         if hit(A::DuplicateLine) {
             return Some(Action::Duplicate);
         }
-        // Typing a closing brace on a blank line dedents it.
-        let mut closing = None;
+        if hit(A::MoveLineUp) {
+            return Some(Action::MoveUp);
+        }
+        if hit(A::MoveLineDown) {
+            return Some(Action::MoveDown);
+        }
+        if auto_close && i.consume_key(Modifiers::NONE, Key::Backspace) {
+            return Some(Action::Backspace);
+        }
+        // Typing a closing brace on a blank line dedents it; with auto-close,
+        // openers insert their pair and closers step over an existing one.
+        let mut picked = None;
         i.events.retain(|e| {
-            if closing.is_none()
+            if picked.is_none()
                 && let Event::Text(t) = e
-                && (t == "}" || t == ")" || t == "]")
+                && t.chars().count() == 1
+                && let Some(ch) = t.chars().next()
             {
-                closing = t.chars().next();
-                return false;
+                if matches!(ch, '}' | ')' | ']') || (auto_close && matches!(ch, '"' | '\'')) {
+                    picked = Some(Action::Closing(ch));
+                    return false;
+                }
+                if auto_close && matches!(ch, '(' | '[' | '{') {
+                    picked = Some(Action::Open(ch));
+                    return false;
+                }
             }
             true
         });
-        closing.map(Action::Closing)
-    });
+        picked
+    }));
     let Some(action) = action else { return };
 
     let new_sel = match action {
@@ -419,12 +553,360 @@ fn handle_keys(ui: &mut Ui, doc: &mut Document, keymap: &crate::settings::Keymap
             c..c
         }
         Action::Closing(ch) => {
-            let c = textops::type_closing_brace(&mut doc.text, sel, ch);
-            c..c
+            if auto_close && let Some(c) = textops::skip_closer(&doc.text, &sel, ch) {
+                doc.set_selection_now(&ctx, c..c);
+                return;
+            }
+            if matches!(ch, '"' | '\'') {
+                match textops::auto_close(&mut doc.text, sel.clone(), ch) {
+                    Some(r) => r,
+                    None => {
+                        doc.text.replace_range(sel.clone(), &ch.to_string());
+                        let c = sel.start + 1;
+                        c..c
+                    }
+                }
+            } else {
+                let c = textops::type_closing_brace(&mut doc.text, sel, ch);
+                c..c
+            }
+        }
+        Action::Open(ch) => match textops::auto_close(&mut doc.text, sel.clone(), ch) {
+            Some(r) => r,
+            None => {
+                doc.text.replace_range(sel.clone(), &ch.to_string());
+                let c = sel.start + 1;
+                c..c
+            }
+        },
+        Action::Backspace => match textops::delete_pair(&mut doc.text, &sel) {
+            Some(c) => c..c,
+            None => {
+                // Not a pair: put the key back for the text editor.
+                ctx.input_mut(|i| {
+                    i.events.push(Event::Key {
+                        key: Key::Backspace,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: Modifiers::NONE,
+                    })
+                });
+                return;
+            }
+        },
+        Action::MoveUp | Action::MoveDown => {
+            match textops::move_lines(&mut doc.text, sel, matches!(action, Action::MoveUp)) {
+                Some(r) => r,
+                None => return,
+            }
         }
     };
     doc.mark_changed();
     doc.set_selection_now(&ctx, new_sel);
+}
+
+/// Lines longer than this are drawn only around the visible part (assuming a
+/// monospace font), so a megabyte-long line isn't laid out every frame.
+const LONG_LINE: usize = 4000;
+
+/// Columns `s` takes in a monospace font (egui draws a tab 4 spaces wide).
+fn mono_cols(s: &str) -> usize {
+    s.chars().map(|c| if c == '\t' { 4 } else { 1 }).sum()
+}
+
+/// Byte offset in `s` of monospace column `col` (clamped to the end).
+fn col_to_byte(s: &str, col: usize) -> usize {
+    let mut cols = 0;
+    for (i, c) in s.char_indices() {
+        let w = if c == '\t' { 4 } else { 1 };
+        if cols + w > col {
+            return if col - cols > w / 2 { i + c.len_utf8() } else { i };
+        }
+        cols += w;
+    }
+    s.len()
+}
+
+/// A laid-out line (or the visible part of a long one).
+struct LineLayout {
+    /// Byte range of the line, without its newline.
+    range: Range<usize>,
+    /// The part of the line that `galley` shows.
+    shown: Range<usize>,
+    /// x of the start of `shown`, relative to the start of the line.
+    x0: f32,
+    galley: Arc<Galley>,
+}
+
+impl LineLayout {
+    /// x of byte `b` (clamped to the line), relative to the start of the line.
+    fn x_of(&self, text: &str, b: usize, char_w: f32) -> f32 {
+        let b = textops::floor_char_boundary(text, b.clamp(self.range.start, self.range.end));
+        if b < self.shown.start || b > self.shown.end {
+            return mono_cols(&text[self.range.start..b]) as f32 * char_w;
+        }
+        let ci = text[self.shown.start..b].chars().count();
+        self.x0 + self.galley.pos_from_cursor(CCursor::new(ci)).min.x
+    }
+
+    /// Byte closest to `x` (relative to the start of the line).
+    fn byte_at_x(&self, text: &str, x: f32, char_w: f32) -> usize {
+        if self.shown != self.range {
+            let col = (x / char_w).round().max(0.0) as usize;
+            return self.range.start + col_to_byte(&text[self.range.clone()], col);
+        }
+        let c = self.galley.cursor_from_pos(vec2(x - self.x0, 1.0));
+        self.shown.start + textops::char_to_byte(&text[self.shown.clone()], c.index.0)
+    }
+
+    fn width(&self, text: &str, char_w: f32) -> f32 {
+        self.x_of(text, self.range.end, char_w)
+    }
+}
+
+/// The part of `range` to lay out for horizontal view `vis_x` (pixels from
+/// the line start), and the x where it starts.
+fn shown_part(text: &str, range: Range<usize>, vis_x: &Range<f32>, char_w: f32) -> (Range<usize>, f32) {
+    if range.len() <= LONG_LINE {
+        return (range, 0.0);
+    }
+    let line = &text[range.clone()];
+    let col0 = ((vis_x.start / char_w) as usize).saturating_sub(64);
+    let cols = ((vis_x.end - vis_x.start).max(0.0) / char_w) as usize + 128;
+    let b0 = col_to_byte(line, col0);
+    let x0 = mono_cols(&line[..b0]) as f32 * char_w;
+    let b1 = b0 + col_to_byte(&line[b0..], cols);
+    (range.start + b0..range.start + b1, x0)
+}
+
+/// Lay out a line without highlighting (for positions on lines not drawn).
+fn plain_layout(ui: &Ui, doc: &Document, line: usize, font: &FontId) -> LineLayout {
+    let range = doc.index.line_range(line.min(doc.index.line_count() - 1));
+    let (shown, x0) = if range.len() > LONG_LINE { (range.start..range.start, 0.0) } else { (range.clone(), 0.0) };
+    let job = egui::text::LayoutJob::simple_singleline(doc.text[shown.clone()].to_string(), font.clone(), egui::Color32::WHITE);
+    let galley = ui.fonts_mut(|f| f.layout_job(job));
+    LineLayout { range, shown, x0, galley }
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+#[derive(PartialEq)]
+enum CharClass {
+    Word,
+    Space,
+    Punct,
+    Newline,
+}
+
+fn class_of(c: char) -> CharClass {
+    if c == '\n' {
+        CharClass::Newline
+    } else if c.is_whitespace() {
+        CharClass::Space
+    } else if c.is_alphanumeric() || c == '_' {
+        CharClass::Word
+    } else {
+        CharClass::Punct
+    }
+}
+
+fn prev_char(text: &str, b: usize) -> usize {
+    text[..b].chars().next_back().map_or(0, |c| b - c.len_utf8())
+}
+
+fn next_char(text: &str, b: usize) -> usize {
+    text[b..].chars().next().map_or(text.len(), |c| b + c.len_utf8())
+}
+
+/// Start of the word before `b` (skipping spaces first).
+fn word_left(text: &str, mut b: usize) -> usize {
+    let mut it = text[..b].chars().rev().peekable();
+    if it.peek() == Some(&'\n') {
+        return b - 1;
+    }
+    while let Some(&c) = it.peek() {
+        if class_of(c) != CharClass::Space {
+            break;
+        }
+        b -= c.len_utf8();
+        it.next();
+    }
+    let Some(&first) = it.peek() else { return b };
+    let class = class_of(first);
+    if class == CharClass::Newline {
+        return b;
+    }
+    while let Some(&c) = it.peek() {
+        if class_of(c) != class {
+            break;
+        }
+        b -= c.len_utf8();
+        it.next();
+    }
+    b
+}
+
+/// End of the word after `b` (skipping spaces first).
+fn word_right(text: &str, mut b: usize) -> usize {
+    let mut it = text[b..].chars().peekable();
+    if it.peek() == Some(&'\n') {
+        return b + 1;
+    }
+    while let Some(&c) = it.peek() {
+        if class_of(c) != CharClass::Space {
+            break;
+        }
+        b += c.len_utf8();
+        it.next();
+    }
+    let Some(&first) = it.peek() else { return b };
+    let class = class_of(first);
+    if class == CharClass::Newline {
+        return b;
+    }
+    while let Some(&c) = it.peek() {
+        if class_of(c) != class {
+            break;
+        }
+        b += c.len_utf8();
+        it.next();
+    }
+    b
+}
+
+/// The identifier touching byte `b`, if any.
+fn ident_at(text: &str, b: usize) -> Option<Range<usize>> {
+    let bytes = text.as_bytes();
+    let mut s = b.min(bytes.len());
+    while s > 0 && is_ident_byte(bytes[s - 1]) {
+        s -= 1;
+    }
+    let mut e = b.min(bytes.len());
+    while e < bytes.len() && is_ident_byte(bytes[e]) {
+        e += 1;
+    }
+    (e > s && !bytes[s].is_ascii_digit()).then_some(s..e)
+}
+
+/// Find the bracket matching the one at or just before the caret, skipping
+/// brackets in strings and comments. Returns (bracket at caret, its match).
+fn bracket_pair(doc: &mut Document) -> Option<(usize, usize)> {
+    let key = (doc.version, doc.head);
+    if let Some((k, v)) = doc.bracket_cache
+        && k == key
+    {
+        return v;
+    }
+    let v = find_bracket_pair(doc);
+    doc.bracket_cache = Some((key, v));
+    v
+}
+
+fn find_bracket_pair(doc: &mut Document) -> Option<(usize, usize)> {
+    const MAX_LINES: usize = 5000;
+    let lang = doc.lang;
+    if lang == Language::Plain {
+        return None;
+    }
+    let bytes = doc.text.as_bytes();
+    let h = doc.head.min(bytes.len());
+    let is_br = |c: u8| matches!(c, b'(' | b')' | b'[' | b']' | b'{' | b'}');
+    let p = if h < bytes.len() && is_br(bytes[h]) {
+        h
+    } else if h > 0 && is_br(bytes[h - 1]) {
+        h - 1
+    } else {
+        return None;
+    };
+    let c = bytes[p];
+    let (open, close, forward) = match c {
+        b'(' => (b'(', b')', true),
+        b'[' => (b'[', b']', true),
+        b'{' => (b'{', b'}', true),
+        b')' => (b'(', b')', false),
+        b']' => (b'[', b']', false),
+        _ => (b'{', b'}', false),
+    };
+    let code = |t: highlight::Tok| !matches!(t, highlight::Tok::Str | highlight::Tok::Comment);
+    let mut spans = Vec::new();
+    let start_line = doc.index.line_of(p);
+    let lc = doc.index.line_count();
+    let mut depth = 0i32;
+    let mut first = true;
+    let mut lines: Box<dyn Iterator<Item = usize>> = if forward {
+        Box::new(start_line..(start_line + MAX_LINES).min(lc))
+    } else {
+        Box::new((start_line.saturating_sub(MAX_LINES)..=start_line).rev())
+    };
+    for line in &mut lines {
+        let range = doc.index.line_range(line);
+        let st = doc.index.state_at(&doc.text, lang, line);
+        spans.clear();
+        highlight::lex_line(lang, &doc.text, range, st, &mut spans);
+        let bytes = doc.text.as_bytes();
+        if first {
+            first = false;
+            // The bracket at the caret must itself be code.
+            if !spans.iter().any(|(r, t)| r.contains(&p) && code(*t)) {
+                return None;
+            }
+        }
+        let mut visit = |i: usize| -> Option<usize> {
+            if bytes[i] == open {
+                depth += if forward { 1 } else { -1 };
+            } else if bytes[i] == close {
+                depth += if forward { -1 } else { 1 };
+            } else {
+                return None;
+            }
+            (depth == 0).then_some(i)
+        };
+        if forward {
+            for (r, t) in &spans {
+                if !code(*t) || r.end <= p {
+                    continue;
+                }
+                for i in r.start.max(p)..r.end {
+                    if let Some(m) = visit(i) {
+                        return Some((p, m));
+                    }
+                }
+            }
+        } else {
+            for (r, t) in spans.iter().rev() {
+                if !code(*t) || r.start > p {
+                    continue;
+                }
+                for i in (r.start..r.end.min(p + 1)).rev() {
+                    if let Some(m) = visit(i) {
+                        return Some((p, m));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Whole-word (for identifiers) or plain occurrences of `needle` in `hay`,
+/// offset by `base`.
+fn occurrences(hay: &str, base: usize, needle: &str, whole_word: bool, out: &mut Vec<Range<usize>>) {
+    if needle.is_empty() {
+        return;
+    }
+    let hb = hay.as_bytes();
+    let mut from = 0;
+    while let Some(i) = hay[from..].find(needle) {
+        let s = from + i;
+        let e = s + needle.len();
+        if !whole_word || ((s == 0 || !is_ident_byte(hb[s - 1])) && (e == hb.len() || !is_ident_byte(hb[e]))) {
+            out.push(base + s..base + e);
+        }
+        from = e;
+    }
 }
 
 pub fn show(
@@ -438,6 +920,8 @@ pub fn show(
     debug: &DebugMarks,
 ) -> EditorOutput {
     let id = doc.text_edit_id();
+    let ctx = ui.ctx().clone();
+    doc.sync();
     let font = FontId::monospace(font_size);
     let has_focus = ui.memory(|m| m.has_focus(id));
     let mut out = EditorOutput::default();
@@ -449,18 +933,16 @@ pub fn show(
                 .collect()
         });
         handle_keys(ui, doc, keymap);
+        doc.sync();
     }
 
-    let mut scroll_to_cursor = false;
     if let Some(sel) = doc.pending_select.take() {
-        let sel = textops::floor_char_boundary(&doc.text, sel.start)
-            ..textops::floor_char_boundary(&doc.text, sel.end);
-        doc.set_selection_now(ui.ctx(), sel);
+        doc.set_selection(sel);
         if doc.pending_focus {
             doc.refocus_frames = 3;
         }
         doc.pending_focus = true;
-        scroll_to_cursor = true;
+        doc.scroll_to_caret = Some(true);
     }
 
     if doc.refocus_frames > 0 {
@@ -471,259 +953,351 @@ pub fn show(
         ui.ctx().request_repaint();
     }
 
-    let (row_height, char_w) = ui.fonts_mut(|f| (f.row_height(&font), f.glyph_width(&font, '0')));
-    let line_count = doc.line_count();
+    let (row_h, char_w) = ui.fonts_mut(|f| (f.row_height(&font), f.glyph_width(&font, '0')));
+    let line_count = doc.index.line_count();
     let digits = line_count.to_string().len().max(3);
     let gutter_w = char_w * (digits as f32 + 3.0);
     let text_margin_left = gutter_w + char_w;
     let avail = ui.available_size();
-
+    let pad_top = 4.0;
+    let content = vec2(
+        (text_margin_left + doc.index.max_line_len as f32 * char_w * 1.2 + 64.0).max(avail.x),
+        (pad_top + line_count as f32 * row_h + avail.y * 0.4).max(avail.y),
+    );
     let lang = doc.lang;
-    let ppp = ui.ctx().pixels_per_point();
-    let sem_version = doc.semantic_version;
-    let semantic = &doc.semantic;
-    let cache = &mut doc.galley_cache;
-    let mut layouter = |ui: &Ui, buf: &dyn TextBuffer, _wrap: f32| -> Arc<Galley> {
-        let text = buf.as_str();
-        let th = hash_text(text);
-        let matches_valid = find.open && find.text_hash == th;
-        let mut h = DefaultHasher::new();
-        (th, matches_valid, font_size.to_bits(), ppp.to_bits(), lang, sem_version).hash(&mut h);
-        if matches_valid {
-            (&find.matches, find.current).hash(&mut h);
-        }
-        let key = h.finish();
-        if let Some((k, g)) = cache.as_ref()
-            && *k == key
-        {
-            return g.clone();
-        }
-        let (m, cur): (&[Range<usize>], _) = if matches_valid {
-            (&find.matches, find.current)
-        } else {
-            (&[], None)
-        };
-        let mut job = highlight::layout_job(lang, text, font.clone(), theme, m, cur, semantic);
-        job.wrap.max_width = f32::INFINITY;
-        let g = ui.fonts_mut(|f| f.layout_job(job));
-        *cache = Some((key, g.clone()));
-        g
-    };
+    let mac = ctx.os() == egui::os::OperatingSystem::Mac;
+    let now = ui.input(|i| i.time);
 
-    let mut focused = false;
+    let mut focused = has_focus;
     let bg = theme.bg;
     egui::Frame::NONE.fill(bg).show(ui, |ui| {
         ScrollArea::both()
             .id_salt(("cedit-scroll", doc.id))
             .auto_shrink([false, false])
-            .show(ui, |ui| {
-                ui.spacing_mut().item_spacing = Vec2::ZERO;
-                let line_bg_idx = ui.painter().add(Shape::Noop);
-                let exec_bg_idx = ui.painter().add(Shape::Noop);
-                let heat_bg_idx = ui.painter().add(Shape::Noop);
-                let output = ui.horizontal_top(|ui| {
-                ui.add_space(text_margin_left);
-                TextEdit::multiline(&mut doc.text)
-                    .id(id)
-                    .font(font.clone())
-                    .frame(egui::Frame::NONE)
-                    .margin(egui::Margin {
-                        left: 0,
-                        right: 24,
-                        top: 4,
-                        bottom: 4,
-                    })
-                    .desired_width(f32::INFINITY)
-                    .min_size(vec2((avail.x - text_margin_left).max(10.0), avail.y))
-                    .lock_focus(true)
-                    .layouter(&mut layouter)
-                    .show(ui)
-                }).inner;
+            .show_viewport(ui, |ui, viewport| {
+                let (rect, _) = ui.allocate_exact_size(content, Sense::hover());
+                let resp = ui.interact(rect, id, Sense::click_and_drag());
+                let clip = ui.clip_rect();
+                let text_x = rect.min.x + text_margin_left;
+                let text_y = rect.min.y + pad_top;
+                let line_y = |l: usize| text_y + l as f32 * row_h;
+                let line_at = |y: f32| (((y - text_y) / row_h).floor().max(0.0) as usize).min(line_count - 1);
+                let gutter = Rect::from_min_max(pos2(clip.left(), clip.top()), pos2(clip.left() + gutter_w, clip.bottom()));
+                let pos_to_byte = |ui: &Ui, doc: &Document, p: egui::Pos2| -> usize {
+                    let l = line_at(p.y);
+                    plain_layout(ui, doc, l, &font).byte_at_x(&doc.text, p.x - text_x, char_w)
+                };
 
-                focused = output.response.response.has_focus();
-                if output.response.response.changed() {
-                    doc.dirty = doc.text != doc.saved;
-                    doc.version += 1;
-                }
-
-                let galley = &output.galley;
-                let origin = output.galley_pos - vec2(galley.rect.left(), 0.0);
-
-                // Pointer: hover and Cmd+click targets.
-                let resp = &output.response.response;
-                if let Some(p) = resp.hover_pos() {
-                    let c = galley.cursor_from_pos(p - origin);
-                    let b = textops::char_to_byte(&doc.text, c.index.0);
+                // ---- Mouse
+                let pointer = ui.input(|i| i.pointer.interact_pos());
+                let modifiers = ui.input(|i| i.modifiers);
+                let in_text = |p: egui::Pos2| p.x >= gutter.right() && clip.contains(p);
+                if let Some(p) = pointer
+                    && resp.contains_pointer()
+                    && in_text(p)
+                {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+                    let b = pos_to_byte(ui, doc, p);
                     out.hover = Some((b, p));
-                    if resp.clicked() && ui.input(|i| i.modifiers.command) {
+                    if ui.input(|i| i.pointer.primary_pressed()) {
+                        ui.memory_mut(|m| m.request_focus(id));
+                        focused = true;
+                        if modifiers.shift {
+                            doc.head = b;
+                        } else {
+                            doc.anchor = b;
+                            doc.head = b;
+                        }
+                        doc.desired_x = None;
+                        doc.index.seal();
+                        doc.drag_unit = 1;
+                    }
+                    if resp.clicked() && modifiers.command {
                         out.cmd_click = Some(b);
                     }
-                }
-
-                // Cursor bookkeeping (status bar + current line).
-                let mut cursor_row_y = None;
-                if let Some(range) = output.cursor_range {
-                    let rect = galley.pos_from_cursor(range.primary);
-                    out.cursor_rect = Some(Rect::from_min_size(origin + rect.min.to_vec2(), vec2(2.0, row_height)));
-                    let cb = textops::char_to_byte(&doc.text, range.primary.index.0);
-                    out.cursor = Some(cb);
-                    doc.cursor_byte = cb;
-                    cursor_row_y = Some(origin.y + rect.min.y);
-                    let key = (range.primary.index.0, range.secondary.index.0, doc.text.len());
-                    if doc.last_cursor != Some(key) {
-                        doc.last_cursor = Some(key);
-                        let b = textops::char_to_byte(&doc.text, range.primary.index.0);
-                        doc.cursor_line_col = textops::line_col(&doc.text, b);
-                        let r = range.as_sorted_char_range();
-                        doc.selection_chars = r.end.0 - r.start.0;
-                    }
-                    if scroll_to_cursor {
-                        let r = Rect::from_min_size(
-                            origin + rect.min.to_vec2(),
-                            vec2(2.0, row_height),
-                        );
-                        ui.scroll_to_rect(r.expand2(vec2(80.0, 0.0)), Some(Align::Center));
+                    if resp.triple_clicked() {
+                        let l = doc.index.line_of(b);
+                        let end = (doc.index.line_end(l) + 1).min(doc.text.len());
+                        doc.anchor = doc.index.line_start(l);
+                        doc.head = end;
+                        doc.drag_unit = 0;
+                    } else if resp.double_clicked() {
+                        let r = ident_at(&doc.text, b).unwrap_or_else(|| b..next_char(&doc.text, b).min(doc.index.line_end(doc.index.line_of(b))));
+                        doc.anchor = r.start;
+                        doc.head = r.end;
+                        doc.drag_unit = 0;
                     }
                 }
-
-                let clip = ui.clip_rect();
-                if let Some(y) = cursor_row_y
-                    && focused
-                {
-                    ui.painter().set(
-                        line_bg_idx,
-                        Shape::rect_filled(
-                            Rect::from_min_max(pos2(clip.left(), y), pos2(clip.right(), y + row_height)),
-                            0.0,
-                            theme.current_line_bg,
-                        ),
-                    );
+                if doc.drag_unit > 0 {
+                    let (down, released, origin) = ui.input(|i| (i.pointer.primary_down(), i.pointer.primary_released(), i.pointer.press_origin()));
+                    let moved = pointer.zip(origin).is_some_and(|(p, o)| (p - o).length() > 2.0);
+                    if down || released {
+                        if let Some(p) = pointer
+                            && (resp.dragged() || moved)
+                        {
+                            let b = pos_to_byte(ui, doc, pos2(p.x.max(gutter.right()), p.y));
+                            if b != doc.head {
+                                doc.head = b;
+                            }
+                            if down && !clip.shrink2(vec2(0.0, row_h * 0.5)).contains(p) {
+                                doc.scroll_to_caret = Some(false);
+                                ui.ctx().request_repaint();
+                            }
+                        }
+                    }
+                    if !down {
+                        doc.drag_unit = 0;
+                    }
                 }
 
-                // Line-number gutter, pinned to the left edge of the viewport.
-                let gutter = Rect::from_min_max(
-                    pos2(clip.left(), clip.top()),
-                    pos2(clip.left() + gutter_w, clip.bottom()),
-                );
-                let painter = ui.painter().with_clip_rect(gutter);
-                painter.rect_filled(gutter, 0.0, bg);
-                let rows = &galley.rows;
-                let pitch = if rows.len() > 1 {
-                    (rows[rows.len() - 1].pos.y - rows[0].pos.y) / (rows.len() - 1) as f32
+                // ---- Keyboard
+                if focused {
+                    ui.memory_mut(|m| {
+                        m.set_focus_lock_filter(
+                            id,
+                            egui::EventFilter { tab: true, horizontal_arrows: true, vertical_arrows: true, escape: false },
+                        )
+                    });
+                    let events = ui.input(|i| i.events.clone());
+                    let page = ((clip.height() / row_h) as usize).saturating_sub(1).max(1);
+                    for ev in events {
+                        handle_event(ui, doc, &ev, mac, page, &font, char_w);
+                    }
+                }
+
+                // ---- Caret bookkeeping
+                let sel = doc.selection(&ctx);
+                let head = doc.head;
+                let key = (doc.anchor, head, doc.version);
+                if doc.last_head != Some(key) {
+                    doc.last_head = Some(key);
+                    doc.caret_time = now;
+                    let l = doc.index.line_of(head);
+                    let ls = doc.index.line_start(l);
+                    doc.cursor_line_col = (l, doc.text[ls..head].chars().count());
+                    doc.selection_chars = if sel.len() > 1 << 20 { sel.len() } else { doc.text[sel.clone()].chars().count() };
+                }
+                doc.cursor_byte = head;
+                out.cursor = Some(head);
+
+                // ---- Visible lines
+                let first = (((viewport.min.y - pad_top) / row_h).floor().max(0.0) as usize).min(line_count - 1);
+                let last = ((((viewport.max.y - pad_top) / row_h).ceil().max(0.0)) as usize + 1).clamp(first + 1, line_count);
+                doc.index.state_at(&doc.text, lang, last - 1);
+                let vis_x = (viewport.min.x - text_margin_left).max(0.0)..(viewport.max.x - text_margin_left).max(0.0);
+
+                // Overlays: find matches, other occurrences, matching brackets.
+                let find_valid = find.open && find.doc_key == (doc.id, doc.version);
+                let vis_range = doc.index.line_start(first)..doc.index.line_end(last - 1);
+                let mut occ: Vec<Range<usize>> = Vec::new();
+                let needle = if sel.is_empty() {
+                    ident_at(&doc.text, head).map(|r| (doc.text[r].to_string(), true))
+                } else if sel.len() <= 256 && !doc.text[sel.clone()].contains('\n') && !doc.text[sel.clone()].trim().is_empty() {
+                    Some((doc.text[sel.clone()].to_string(), false))
                 } else {
-                    row_height
+                    None
                 };
-                let first = (((clip.top() - origin.y) / pitch).floor().max(0.0)) as usize;
-                let last = ((((clip.bottom() - origin.y) / pitch).ceil()) as usize + 1)
-                    .min(line_count)
-                    .min(rows.len());
-                let cur_line = doc.cursor_line_col.0;
+                if let Some((n, whole)) = &needle {
+                    occurrences(&doc.text[vis_range.clone()], vis_range.start, n, *whole, &mut occ);
+                    if occ.len() < 2 && *whole {
+                        occ.clear();
+                    }
+                }
+                let brackets = if sel.is_empty() { bracket_pair(doc) } else { None };
+                let occ_bg = theme.selection.gamma_multiply(0.45);
+                let bracket_bg = theme.text.gamma_multiply(0.22);
+
+                let mut layouts: Vec<LineLayout> = Vec::with_capacity(last - first);
+                let mut spans = Vec::new();
+                let mut overlays: Vec<(Range<usize>, egui::Color32)> = Vec::new();
+                let mi0 = if find_valid { find.matches.partition_point(|m| m.end < vis_range.start) } else { 0 };
+                let oi0 = 0usize;
+                let _ = oi0;
                 for line in first..last {
-                    let y = origin.y + rows[line].pos.y;
-                    let color = if line == cur_line && focused {
-                        theme.gutter_current_fg
+                    let range = doc.index.line_range(line);
+                    let st = doc.index.state_at(&doc.text, lang, line);
+                    spans.clear();
+                    highlight::lex_line(lang, &doc.text, range.clone(), st, &mut spans);
+                    let (shown, x0) = shown_part(&doc.text, range.clone(), &vis_x, char_w);
+                    overlays.clear();
+                    for r in &occ {
+                        if r.start < range.end.max(range.start + 1) && r.end > range.start {
+                            overlays.push((r.clone(), occ_bg));
+                        }
+                    }
+                    if find_valid {
+                        let mut mi = mi0;
+                        while mi < find.matches.len() && find.matches[mi].start <= range.end {
+                            let m = &find.matches[mi];
+                            if m.end > range.start || (m.start == range.start && m.is_empty()) {
+                                let c = if find.current == Some(mi) { theme.current_match_bg } else { theme.match_bg };
+                                overlays.push((m.clone(), c));
+                            }
+                            mi += 1;
+                        }
+                    }
+                    if let Some((a, b)) = brackets {
+                        for p in [a, b] {
+                            if range.contains(&p) {
+                                overlays.push((p..p + 1, bracket_bg));
+                            }
+                        }
+                    }
+                    let job = highlight::line_job(&doc.text, shown.clone(), &spans, &doc.semantic, &overlays, &font, theme);
+                    let galley = ui.fonts_mut(|f| f.layout_job(job));
+                    layouts.push(LineLayout { range, shown, x0, galley });
+                }
+                let layout_of = |ui: &Ui, doc: &Document, l: usize| -> LineLayout {
+                    if l >= first && l < last {
+                        let ll = &layouts[l - first];
+                        LineLayout { range: ll.range.clone(), shown: ll.shown.clone(), x0: ll.x0, galley: ll.galley.clone() }
                     } else {
-                        theme.gutter_fg
-                    };
-                    painter.text(
-                        pos2(gutter.right() - char_w, y),
-                        Align2::RIGHT_TOP,
-                        (line + 1).to_string(),
-                        font.clone(),
-                        color,
+                        plain_layout(ui, doc, l, &font)
+                    }
+                };
+
+                // ---- Backgrounds
+                let painter = ui.painter().clone();
+                let head_line = doc.index.line_of(head);
+                let caret_ll = layout_of(ui, doc, head_line);
+                let caret_x = text_x + caret_ll.x_of(&doc.text, head, char_w);
+                let caret_rect = Rect::from_min_size(pos2(caret_x, line_y(head_line)), vec2(2.0, row_h));
+                out.cursor_rect = Some(caret_rect);
+                if focused {
+                    painter.rect_filled(
+                        Rect::from_min_max(pos2(clip.left(), line_y(head_line)), pos2(clip.right(), line_y(head_line) + row_h)),
+                        0.0,
+                        theme.current_line_bg,
                     );
                 }
-                // Breakpoints: click the gutter to toggle.
-                let gresp = ui.interact(gutter, id.with("gutter"), Sense::click());
-                let line_at = |y: f32| (((y - origin.y) / pitch).floor().max(0.0) as usize).min(line_count.saturating_sub(1));
-                let dot_center = |y: f32| pos2(gutter.left() + char_w * 0.5 + 4.0, y + pitch * 0.5);
-                let dot_r = (pitch * 0.28).clamp(3.0, 6.0);
-                let bp_color = theme.error;
-                for &(line, verified) in &debug.breakpoints {
-                    let Some(row) = rows.get(line) else { continue };
-                    let c = dot_center(origin.y + row.pos.y);
-                    if verified {
-                        painter.circle_filled(c, dot_r, bp_color);
-                    } else {
-                        painter.circle_stroke(c, dot_r - 0.5, egui::Stroke::new(1.5, bp_color));
-                    }
+                if let Some(line) = debug.exec_line
+                    && line < line_count
+                {
+                    let y = line_y(line);
+                    let color = if debug.exec_top { theme.warning } else { theme.function };
+                    painter.rect_filled(Rect::from_min_max(pos2(clip.left(), y), pos2(clip.right(), y + row_h)), 0.0, color.gamma_multiply(0.18));
                 }
-                if let Some(p) = gresp.hover_pos() {
-                    let line = line_at(p.y);
-                    if !debug.breakpoints.iter().any(|b| b.0 == line)
-                        && let Some(row) = rows.get(line)
-                    {
-                        painter.circle_filled(dot_center(origin.y + row.pos.y), dot_r, bp_color.gamma_multiply(0.35));
-                    }
-                    if gresp.clicked() {
-                        out.gutter_click = Some(line);
-                    }
-                }
-                // Profiler heat: shade hot lines and show their share of samples.
-                let mut heat_shapes = Vec::new();
                 for &(line, frac) in &debug.heat {
-                    let Some(row) = rows.get(line) else { continue };
-                    let y = origin.y + row.pos.y;
-                    if y + pitch < clip.top() || y > clip.bottom() || frac < 0.002 {
+                    if line >= line_count || frac < 0.002 {
+                        continue;
+                    }
+                    let y = line_y(line);
+                    if y + row_h < clip.top() || y > clip.bottom() {
                         continue;
                     }
                     let alpha = (0.08 + frac * 0.8).min(0.4);
-                    heat_shapes.push(Shape::rect_filled(
-                        Rect::from_min_max(pos2(gutter.right(), y), pos2(clip.right(), y + pitch)),
-                        0.0,
-                        theme.error.gamma_multiply(alpha),
-                    ));
-                    ui.painter().text(
-                        pos2(clip.right() - 8.0, y + pitch * 0.5),
+                    painter.rect_filled(Rect::from_min_max(pos2(gutter.right(), y), pos2(clip.right(), y + row_h)), 0.0, theme.error.gamma_multiply(alpha));
+                    painter.text(
+                        pos2(clip.right() - 8.0, y + row_h * 0.5),
                         Align2::RIGHT_CENTER,
                         format!("{:.1}%", frac * 100.0),
                         FontId::proportional((font_size - 2.0).max(9.0)),
                         theme.warning,
                     );
                 }
-                ui.painter().set(heat_bg_idx, Shape::Vec(heat_shapes));
-                // Debugger: variable values after the end of the lines that use them.
-                let text_clip = Rect::from_min_max(pos2(gutter.right(), clip.top()), clip.max);
-                let inline_painter = ui.painter().with_clip_rect(text_clip);
-                let inline_font = FontId::monospace((font_size - 1.0).max(9.0));
-                for (line, text) in &debug.inline {
-                    let Some(row) = rows.get(*line) else { continue };
-                    let y = origin.y + row.pos.y;
-                    if y + pitch < clip.top() || y > clip.bottom() {
-                        continue;
+                if !sel.is_empty() {
+                    let sel_bg = if focused { theme.selection } else { theme.selection.gamma_multiply(0.6) };
+                    for ll in &layouts {
+                        if ll.range.start > sel.end || sel.start > ll.range.end || (sel.end == ll.range.start && ll.range.start > 0) {
+                            continue;
+                        }
+                        let xa = if sel.start > ll.range.start { ll.x_of(&doc.text, sel.start, char_w) } else { 0.0 };
+                        let xb = if sel.end <= ll.range.end { ll.x_of(&doc.text, sel.end, char_w) } else { ll.width(&doc.text, char_w) + char_w * 0.6 };
+                        let y = line_y(doc.index.line_of(ll.range.start));
+                        painter.rect_filled(Rect::from_min_max(pos2(text_x + xa, y), pos2(text_x + xb, y + row_h)), 0.0, sel_bg);
                     }
-                    let x = origin.x + row.rect().right() + char_w * 3.0;
-                    let galley = inline_painter.layout_no_wrap(text.clone(), inline_font.clone(), theme.function);
-                    let r = Rect::from_min_size(pos2(x, y + (pitch - galley.size().y) * 0.5), galley.size()).expand2(vec2(5.0, 0.0));
-                    inline_painter.rect_filled(r, 3.0, theme.function.gamma_multiply(0.12));
-                    inline_painter.galley(pos2(x, r.top()), galley, theme.function);
-                }
-                if let Some(line) = debug.exec_line
-                    && let Some(row) = rows.get(line)
-                {
-                    let y = origin.y + row.pos.y;
-                    let color = if debug.exec_top { theme.warning } else { theme.function };
-                    ui.painter().set(
-                        exec_bg_idx,
-                        Shape::rect_filled(
-                            Rect::from_min_max(pos2(clip.left(), y), pos2(clip.right(), y + pitch)),
-                            0.0,
-                            color.gamma_multiply(0.18),
-                        ),
-                    );
-                    // An arrow pointing at the line.
-                    let c = dot_center(y);
-                    let h = dot_r * 1.1;
-                    painter.add(Shape::convex_polygon(
-                        vec![pos2(c.x - h, c.y - h), pos2(c.x + h, c.y), pos2(c.x - h, c.y + h)],
-                        color,
-                        egui::Stroke::NONE,
-                    ));
                 }
 
-                // Compiler diagnostics: a marker in the gutter and an underline.
+                // ---- Text
+                let text_clip = Rect::from_min_max(pos2(gutter.right(), clip.top()), clip.max);
+                let text_painter = painter.with_clip_rect(text_clip);
+                for (i, ll) in layouts.iter().enumerate() {
+                    text_painter.galley(pos2(text_x + ll.x0, line_y(first + i)), ll.galley.clone(), theme.text);
+                }
+
+                // ---- Caret and IME composition
+                if focused {
+                    if !doc.preedit.is_empty() {
+                        let g = text_painter.layout_no_wrap(doc.preedit.clone(), font.clone(), theme.text);
+                        let r = Rect::from_min_size(caret_rect.min, g.size());
+                        text_painter.rect_filled(r, 0.0, bg);
+                        text_painter.galley(r.min, g, theme.text);
+                        text_painter.hline(r.x_range(), r.bottom() - 1.0, egui::Stroke::new(1.0, theme.text));
+                    }
+                    let phase = (now - doc.caret_time).rem_euclid(1.0);
+                    if phase < 0.6 {
+                        text_painter.rect_filled(caret_rect, 0.0, ui.visuals().text_cursor.stroke.color);
+                    }
+                    let next = if phase < 0.6 { 0.6 - phase } else { 1.0 - phase };
+                    ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(next + 0.01));
+                    ui.ctx().output_mut(|o| {
+                        o.ime = Some(egui::output::IMEOutput {
+                            purpose: Default::default(),
+                            rect: clip,
+                            cursor_rect: caret_rect,
+                            should_interrupt_composition: false,
+                        })
+                    });
+                }
+
+                // ---- Debugger values after the end of lines
+                let inline_font = FontId::monospace((font_size - 1.0).max(9.0));
+                for (line, text) in &debug.inline {
+                    if *line < first || *line >= last {
+                        continue;
+                    }
+                    let ll = &layouts[line - first];
+                    let y = line_y(*line);
+                    let x = text_x + ll.width(&doc.text, char_w) + char_w * 3.0;
+                    let galley = text_painter.layout_no_wrap(text.clone(), inline_font.clone(), theme.function);
+                    let r = Rect::from_min_size(pos2(x, y + (row_h - galley.size().y) * 0.5), galley.size()).expand2(vec2(5.0, 0.0));
+                    text_painter.rect_filled(r, 3.0, theme.function.gamma_multiply(0.12));
+                    text_painter.galley(pos2(x, r.top()), galley, theme.function);
+                }
+
+                // ---- Gutter, pinned to the left edge of the viewport
+                let gp = painter.with_clip_rect(gutter);
+                gp.rect_filled(gutter, 0.0, bg);
+                for line in first..last {
+                    let color = if line == head_line && focused { theme.gutter_current_fg } else { theme.gutter_fg };
+                    gp.text(pos2(gutter.right() - char_w, line_y(line)), Align2::RIGHT_TOP, (line + 1).to_string(), font.clone(), color);
+                }
+                let gresp = ui.interact(gutter, id.with("gutter"), Sense::click());
+                let dot_center = |y: f32| pos2(gutter.left() + char_w * 0.5 + 4.0, y + row_h * 0.5);
+                let dot_r = (row_h * 0.28).clamp(3.0, 6.0);
+                let bp_color = theme.error;
+                for &(line, verified) in &debug.breakpoints {
+                    if line < first || line >= last {
+                        continue;
+                    }
+                    let c = dot_center(line_y(line));
+                    if verified {
+                        gp.circle_filled(c, dot_r, bp_color);
+                    } else {
+                        gp.circle_stroke(c, dot_r - 0.5, egui::Stroke::new(1.5, bp_color));
+                    }
+                }
+                if let Some(p) = gresp.hover_pos() {
+                    let line = line_at(p.y);
+                    if !debug.breakpoints.iter().any(|b| b.0 == line) {
+                        gp.circle_filled(dot_center(line_y(line)), dot_r, bp_color.gamma_multiply(0.35));
+                    }
+                    if gresp.clicked() {
+                        out.gutter_click = Some(line);
+                    }
+                }
+                if let Some(line) = debug.exec_line
+                    && line < line_count
+                {
+                    let color = if debug.exec_top { theme.warning } else { theme.function };
+                    let c = dot_center(line_y(line));
+                    let h = dot_r * 1.1;
+                    gp.add(Shape::convex_polygon(vec![pos2(c.x - h, c.y - h), pos2(c.x + h, c.y), pos2(c.x - h, c.y + h)], color, egui::Stroke::NONE));
+                }
+
+                // ---- Compiler diagnostics: a gutter marker and a squiggle.
                 // Worst severity last so it wins the gutter marker; one tooltip per line.
-                let mut sorted: Vec<&&crate::make::Diagnostic> = diags.iter().collect();
+                let mut sorted: Vec<&&crate::make::Diagnostic> = diags.iter().filter(|d| d.line >= first && d.line < last).collect();
                 sorted.sort_by(|a, b| b.severity.cmp(&a.severity));
                 let mut line_msgs: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
                 for d in &sorted {
@@ -737,33 +1311,23 @@ pub fn show(
                     }
                 }
                 for (n, d) in sorted.iter().enumerate() {
-                    let Some(row) = rows.get(d.line) else { continue };
-                    let y = origin.y + row.pos.y;
-                    if y + pitch < clip.top() || y > clip.bottom() {
-                        continue;
-                    }
                     let color = match d.severity {
                         crate::make::Severity::Error => theme.error,
                         crate::make::Severity::Warning => theme.warning,
                         crate::make::Severity::Note => continue,
                     };
-                    let marker = Rect::from_min_size(pos2(gutter.left() + 2.0, y + 2.0), vec2(3.0, pitch - 4.0));
-                    painter.rect_filled(marker, 1.0, color);
-                    // Underline the word at the reported column.
-                    let ls = textops::line_to_byte(&doc.text, d.line);
-                    let le = textops::line_end(&doc.text, ls);
-                    let line_text = &doc.text[ls..le];
+                    let y = line_y(d.line);
+                    let ll = &layouts[d.line - first];
+                    gp.rect_filled(Rect::from_min_size(pos2(gutter.left() + 2.0, y + 2.0), vec2(3.0, row_h - 4.0)), 1.0, color);
+                    let line_text = &doc.text[ll.range.clone()];
                     let col = d.col.min(line_text.chars().count());
-                    let word_len = line_text
-                        .chars()
-                        .skip(col)
-                        .take_while(|c| c.is_alphanumeric() || *c == '_')
-                        .count()
-                        .max(1);
-                    let x0 = origin.x + row.pos.x + row.row.x_offset(egui::text::CharIndex(col));
-                    let x1 = origin.x + row.pos.x + row.row.x_offset(egui::text::CharIndex(col + word_len));
+                    let b0 = ll.range.start + textops::char_to_byte(line_text, col);
+                    let word_len = line_text[b0 - ll.range.start..].bytes().take_while(|&c| is_ident_byte(c) || c >= 0x80).count().max(1);
+                    let b1 = textops::floor_char_boundary(&doc.text, (b0 + word_len).min(ll.range.end));
+                    let x0 = text_x + ll.x_of(&doc.text, b0, char_w);
+                    let x1 = text_x + ll.x_of(&doc.text, b1, char_w);
                     let x1 = if x1 <= x0 { x0 + char_w } else { x1 };
-                    let uy = y + pitch - 2.0;
+                    let uy = y + row_h - 2.0;
                     let mut pts = Vec::new();
                     let mut x = x0;
                     let mut up = true;
@@ -773,18 +1337,208 @@ pub fn show(
                         up = !up;
                     }
                     pts.push(pos2(x1, uy));
-                    ui.painter().add(Shape::line(pts, egui::Stroke::new(1.2, color)));
-                    // Hover anywhere on the line's marker or underline for the message.
-                    let hover_rect = Rect::from_min_max(pos2(gutter.left(), y), pos2(gutter.right(), y + pitch))
-                        .union(Rect::from_min_max(pos2(x0, y), pos2(x1, y + pitch)));
+                    text_painter.add(Shape::line(pts, egui::Stroke::new(1.2, color)));
+                    let hover_rect = Rect::from_min_max(pos2(gutter.left(), y), pos2(gutter.right(), y + row_h))
+                        .union(Rect::from_min_max(pos2(x0, y), pos2(x1, y + row_h)));
                     let msg = line_msgs.get(&d.line).cloned().unwrap_or_default();
-                    ui.interact(hover_rect, id.with(("diag", n)), Sense::hover())
-                        .on_hover_text(msg);
+                    ui.interact(hover_rect, id.with(("diag", n)), Sense::hover()).on_hover_text(msg);
+                }
+
+                // ---- Keep the caret in view
+                if let Some(center) = doc.scroll_to_caret.take() {
+                    let r = caret_rect.expand2(vec2(char_w * 4.0, 0.0));
+                    let r = Rect::from_min_max(pos2(r.left().max(rect.left() + text_margin_left - char_w) - gutter_w, r.top()), r.max);
+                    ui.scroll_to_rect(r, if center { Some(Align::Center) } else { None });
                 }
             });
     });
+    if !focused {
+        doc.preedit.clear();
+    }
     out.focused = focused;
     out
+}
+
+thread_local! {
+    /// The last line copied or cut without a selection.
+    static LINE_COPY: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// One input event for the focused editor: caret movement, editing,
+/// clipboard, undo, IME.
+fn handle_event(ui: &Ui, doc: &mut Document, ev: &Event, mac: bool, page: usize, font: &FontId, char_w: f32) {
+    let sel = doc.selection(ui.ctx());
+    match ev {
+        Event::Text(t) if !t.is_empty() && doc.preedit.is_empty() => {
+            doc.edit(sel, t);
+        }
+        Event::Paste(t) => {
+            let t = t.replace("\r\n", "\n");
+            // A line copied without a selection pastes as a whole line above
+            // the caret's line (like CLion).
+            let whole_line = sel.is_empty() && LINE_COPY.with(|c| c.borrow().as_deref() == Some(t.as_str()));
+            if whole_line {
+                let ls = doc.index.line_start(doc.index.line_of(doc.head));
+                let col = doc.head - ls;
+                doc.edit(ls..ls, &t);
+                let c = (ls + t.len() + col).min(doc.text.len());
+                doc.anchor = c;
+                doc.head = c;
+            } else {
+                doc.edit(sel, &t);
+            }
+        }
+        Event::Copy | Event::Cut => {
+            let no_sel = sel.is_empty();
+            let r = if no_sel {
+                // No selection: the whole line (like CLion).
+                let l = doc.index.line_of(doc.head);
+                doc.index.line_start(l)..(doc.index.line_end(l) + 1).min(doc.text.len())
+            } else {
+                sel
+            };
+            let copied = doc.text[r.clone()].to_string();
+            LINE_COPY.with(|c| *c.borrow_mut() = no_sel.then(|| copied.clone()));
+            ui.ctx().copy_text(copied);
+            if matches!(ev, Event::Cut) {
+                doc.edit(r, "");
+            }
+        }
+        Event::Ime(ime) => match ime {
+            egui::ImeEvent::Preedit { text, .. } => doc.preedit = text.clone(),
+            egui::ImeEvent::Commit(t) => {
+                doc.preedit.clear();
+                if !t.is_empty() {
+                    doc.edit(sel, t);
+                }
+            }
+            _ => {}
+        },
+        Event::Key { key, pressed: true, modifiers: m, .. } => handle_key(ui, doc, *key, *m, mac, page, font, char_w),
+        _ => {}
+    }
+}
+
+fn handle_key(ui: &Ui, doc: &mut Document, key: Key, m: Modifiers, mac: bool, page: usize, font: &FontId, char_w: f32) {
+    let sel = doc.selection(ui.ctx());
+    let word = if mac { m.alt } else { m.ctrl };
+    let line_mod = mac && m.mac_cmd;
+    let head = doc.head.min(doc.text.len());
+    let line = doc.index.line_of(head);
+    let ls = doc.index.line_start(line);
+    let le = doc.index.line_end(line);
+    // Home goes to the first non-blank character, then to column 0.
+    let smart_home = {
+        let indent = doc.text[ls..le].len() - doc.text[ls..le].trim_start_matches([' ', '\t']).len();
+        if head == ls + indent { ls } else { ls + indent }
+    };
+    let move_to = |doc: &mut Document, b: usize, extend: bool| {
+        doc.head = b;
+        if !extend {
+            doc.anchor = b;
+        }
+        doc.desired_x = None;
+        doc.index.seal();
+        doc.scroll_to_caret.get_or_insert(false);
+    };
+    let vertical = |ui: &Ui, doc: &mut Document, down: bool, n: usize, extend: bool| {
+        let x = doc.desired_x.unwrap_or_else(|| plain_layout(ui, doc, line, font).x_of(&doc.text, head, char_w));
+        let target = if down { (line + n) as isize } else { line as isize - n as isize };
+        let b = if target < 0 {
+            0
+        } else if target as usize >= doc.index.line_count() {
+            doc.text.len()
+        } else {
+            plain_layout(ui, doc, target as usize, font).byte_at_x(&doc.text, x, char_w)
+        };
+        move_to(doc, b, extend);
+        doc.desired_x = Some(x);
+    };
+    match key {
+        Key::ArrowLeft | Key::ArrowRight => {
+            let fwd = key == Key::ArrowRight;
+            if !m.shift && !sel.is_empty() && !word && !line_mod {
+                move_to(doc, if fwd { sel.end } else { sel.start }, false);
+                return;
+            }
+            let b = if line_mod {
+                if fwd { le } else { smart_home }
+            } else if word {
+                if fwd { word_right(&doc.text, head) } else { word_left(&doc.text, head) }
+            } else if fwd {
+                next_char(&doc.text, head)
+            } else {
+                prev_char(&doc.text, head)
+            };
+            move_to(doc, b, m.shift);
+        }
+        Key::ArrowUp | Key::ArrowDown => {
+            let down = key == Key::ArrowDown;
+            if line_mod {
+                move_to(doc, if down { doc.text.len() } else { 0 }, m.shift);
+            } else if m.alt || m.ctrl {
+                // Left for other bindings (e.g. move line).
+            } else {
+                vertical(ui, doc, down, 1, m.shift);
+            }
+        }
+        Key::PageUp | Key::PageDown => vertical(ui, doc, key == Key::PageDown, page, m.shift),
+        Key::Home | Key::End => {
+            let end = key == Key::End;
+            let b = if m.command { if end { doc.text.len() } else { 0 } } else if end { le } else { smart_home };
+            move_to(doc, b, m.shift);
+        }
+        Key::Backspace => {
+            if !sel.is_empty() {
+                doc.edit(sel, "");
+                return;
+            }
+            if head == 0 {
+                return;
+            }
+            let start = if line_mod {
+                if head == ls { head - 1 } else { ls }
+            } else if word {
+                word_left(&doc.text, head)
+            } else {
+                let before = &doc.text[ls..head];
+                let w = textops::indent_width();
+                if !doc.lang.uses_hard_tabs() && !before.is_empty() && w > 0 && before.bytes().all(|c| c == b' ') {
+                    // Soft tabs: back to the previous indent stop.
+                    ls + ((before.len() - 1) / w) * w
+                } else {
+                    prev_char(&doc.text, head)
+                }
+            };
+            doc.edit(start..head, "");
+        }
+        Key::Delete => {
+            if !sel.is_empty() {
+                doc.edit(sel, "");
+                return;
+            }
+            let end = if line_mod {
+                if head == le { (le + 1).min(doc.text.len()) } else { le }
+            } else if word {
+                word_right(&doc.text, head)
+            } else {
+                next_char(&doc.text, head)
+            };
+            if end > head {
+                doc.edit(head..end, "");
+            }
+        }
+        Key::A if m.command && !m.shift => {
+            doc.anchor = 0;
+            doc.head = doc.text.len();
+            doc.index.seal();
+        }
+        Key::Z if m.command => {
+            if m.shift { doc.redo() } else { doc.undo() }
+        }
+        Key::Y if m.ctrl && !mac => doc.redo(),
+        _ => {}
+    }
 }
 
 /// Write `data` to a brand-new file at `path`. Whatever is already at `path` is

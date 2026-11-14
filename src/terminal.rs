@@ -83,8 +83,8 @@ impl Terminal {
         let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
         let writer: Arc<Mutex<Box<dyn Write + Send>>> =
             Arc::new(Mutex::new(pair.master.take_writer().map_err(|e| e.to_string())?));
-        let rows = std::num::NonZeroU16::new(size.0).unwrap();
-        let cols = std::num::NonZeroU16::new(size.1).unwrap();
+        let rows = std::num::NonZeroU16::new(size.0).unwrap_or(std::num::NonZeroU16::MIN);
+        let cols = std::num::NonZeroU16::new(size.1).unwrap_or(std::num::NonZeroU16::MIN);
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, SCROLLBACK)));
         let reader_done = Arc::new(AtomicBool::new(false));
         {

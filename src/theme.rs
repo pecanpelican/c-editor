@@ -27,6 +27,8 @@ pub struct Theme {
     pub warning: Color32,
     pub italic_comments: bool,
     pub dark: bool,
+    /// Selection background in text fields and the editor.
+    pub selection: Color32,
 }
 
 const fn hex(rgb: u32) -> Color32 {
@@ -59,6 +61,7 @@ impl Theme {
             warning: hex(0xe5b350),
             italic_comments: true,
             dark: true,
+            selection: hex(0x2f4a6e),
         }
     }
 
@@ -87,6 +90,125 @@ impl Theme {
             warning: hex(0xb57800),
             italic_comments: true,
             dark: false,
+            selection: hex(0xc5d9f5),
+        }
+    }
+
+    /// Deep blue-black with saturated accents.
+    pub fn midnight() -> Self {
+        Self {
+            bg: hex(0x10131a),
+            panel_bg: hex(0x151922),
+            gutter_fg: hex(0x4a5263),
+            gutter_current_fg: hex(0xb8c0d0),
+            current_line_bg: hex(0x181c27),
+            text: hex(0xcdd3de),
+            keyword: hex(0xc79bf2),
+            ty: hex(0x5fd3c4),
+            function: hex(0x82aaff),
+            number: hex(0xf78c6c),
+            string: hex(0xc3e88d),
+            comment: hex(0x5f6b7d),
+            preproc: hex(0xffcb6b),
+            constant: hex(0xff9cac),
+            punct: hex(0x8f9bb3),
+            variable: hex(0x5fd3c4),
+            target: hex(0x82aaff),
+            match_bg: Color32::from_rgba_unmultiplied(255, 203, 107, 45),
+            current_match_bg: Color32::from_rgba_unmultiplied(247, 140, 108, 120),
+            error: hex(0xff5370),
+            warning: hex(0xffcb6b),
+            italic_comments: true,
+            dark: true,
+            selection: hex(0x263a5e),
+        }
+    }
+
+    /// Black background, bright text, no italics: easiest to read.
+    pub fn high_contrast() -> Self {
+        Self {
+            bg: hex(0x000000),
+            panel_bg: hex(0x0c0c0c),
+            gutter_fg: hex(0x8a8a8a),
+            gutter_current_fg: hex(0xffffff),
+            current_line_bg: hex(0x1c1c1c),
+            text: hex(0xffffff),
+            keyword: hex(0xff9e57),
+            ty: hex(0x4fe0ff),
+            function: hex(0x7cb7ff),
+            number: hex(0xe0a0ff),
+            string: hex(0x9cff6e),
+            comment: hex(0xa8b0bd),
+            preproc: hex(0xffe066),
+            constant: hex(0xff8fc8),
+            punct: hex(0xd8d8d8),
+            variable: hex(0x4fe0ff),
+            target: hex(0x7cb7ff),
+            match_bg: Color32::from_rgba_unmultiplied(255, 224, 102, 70),
+            current_match_bg: Color32::from_rgba_unmultiplied(255, 158, 87, 150),
+            error: hex(0xff4d4d),
+            warning: hex(0xffd000),
+            italic_comments: false,
+            dark: true,
+            selection: hex(0x1f4f8f),
+        }
+    }
+
+    /// Warm, low-glare light theme.
+    pub fn sepia() -> Self {
+        Self {
+            bg: hex(0xf6f0e3),
+            panel_bg: hex(0xebe3d1),
+            gutter_fg: hex(0xb0a48c),
+            gutter_current_fg: hex(0x4a4030),
+            current_line_bg: hex(0xefe7d5),
+            text: hex(0x3b3326),
+            keyword: hex(0x9c3d10),
+            ty: hex(0x1d6b70),
+            function: hex(0x2a55a0),
+            number: hex(0x7b3fa0),
+            string: hex(0x4f7a12),
+            comment: hex(0x968a74),
+            preproc: hex(0x8a6400),
+            constant: hex(0xa8325e),
+            punct: hex(0x6e6352),
+            variable: hex(0x1d6b70),
+            target: hex(0x2a55a0),
+            match_bg: Color32::from_rgba_unmultiplied(220, 180, 60, 90),
+            current_match_bg: Color32::from_rgba_unmultiplied(230, 130, 50, 140),
+            error: hex(0xc0262d),
+            warning: hex(0xa66b00),
+            italic_comments: true,
+            dark: false,
+            selection: hex(0xe0d0a8),
+        }
+    }
+
+    /// Theme names accepted in settings.json, with display names.
+    pub const NAMES: &'static [(&'static str, &'static str)] = &[
+        ("system", "Match System"),
+        ("dark", "Dark"),
+        ("light", "Light"),
+        ("midnight", "Midnight"),
+        ("high-contrast", "High Contrast"),
+        ("sepia", "Sepia"),
+    ];
+
+    /// The theme for a settings name. "system" follows the OS (dark when unknown).
+    pub fn by_name(name: &str, system_dark: Option<bool>) -> Self {
+        match name.trim().to_ascii_lowercase().replace(['_', ' '], "-").as_str() {
+            "light" => Self::light(),
+            "midnight" => Self::midnight(),
+            "high-contrast" | "contrast" => Self::high_contrast(),
+            "sepia" => Self::sepia(),
+            "system" | "auto" => {
+                if system_dark == Some(false) {
+                    Self::light()
+                } else {
+                    Self::dark()
+                }
+            }
+            _ => Self::dark(),
         }
     }
 
@@ -113,11 +235,10 @@ impl Theme {
         visuals.window_fill = self.panel_bg;
         visuals.extreme_bg_color = self.bg;
         visuals.faint_bg_color = self.current_line_bg;
-        visuals.selection.bg_fill = if self.dark {
-            Color32::from_rgb(0x2f, 0x4a, 0x6e)
-        } else {
-            Color32::from_rgb(0xc5, 0xd9, 0xf5)
-        };
+        visuals.selection.bg_fill = self.selection;
+        visuals.window_stroke.color = self.gutter_fg.gamma_multiply(0.5);
+        visuals.error_fg_color = self.error;
+        visuals.warn_fg_color = self.warning;
         visuals.selection.stroke.color = self.text;
         visuals.hyperlink_color = self.function;
         if self.dark {

@@ -38,6 +38,22 @@ pub struct FileTree {
     pub root: PathBuf,
     expanded: HashSet<PathBuf>,
     children: HashMap<PathBuf, Vec<Entry>>,
+    /// Height of one row as measured last frame (rows are drawn only when visible).
+    row_pitch: f32,
+    /// All files in the project, listed in the background (for quick open).
+    files: FileIndex,
+}
+
+/// A list of every file under the project root, built on a background
+/// thread so opening "Go to file" in a huge tree never blocks the UI.
+#[derive(Default)]
+struct FileIndex {
+    files: Arc<Vec<PathBuf>>,
+    /// Bumped each time a new listing arrives.
+    generation: u64,
+    rx: Option<mpsc::Receiver<Vec<PathBuf>>>,
+    stale: bool,
+    scanned_at: Option<std::time::Instant>,
 }
 
 impl FileTree {
@@ -48,11 +64,43 @@ impl FileTree {
             root,
             expanded,
             children: HashMap::new(),
+            row_pitch: 0.0,
+            files: FileIndex::default(),
         }
     }
 
     pub fn refresh(&mut self) {
         self.children.clear();
+        self.files.stale = true;
+    }
+
+    /// All files under the root (relative paths) and a generation number that
+    /// changes when the list does. The first call starts a background scan
+    /// (the list is empty until it finishes); later calls rescan when the
+    /// list is older than a few seconds or the tree was refreshed.
+    pub fn all_files(&mut self, ctx: &egui::Context) -> (Arc<Vec<PathBuf>>, u64, bool) {
+        let ix = &mut self.files;
+        if let Some(rx) = &ix.rx
+            && let Ok(files) = rx.try_recv()
+        {
+            ix.files = Arc::new(files);
+            ix.generation += 1;
+            ix.rx = None;
+        }
+        let old = ix.scanned_at.is_none_or(|t| t.elapsed().as_secs() >= 5);
+        if ix.rx.is_none() && (ix.stale || old) {
+            ix.stale = false;
+            ix.scanned_at = Some(std::time::Instant::now());
+            let (tx, rx) = mpsc::channel();
+            let root = self.root.clone();
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(list_files(&root));
+                ctx.request_repaint();
+            });
+            ix.rx = Some(rx);
+        }
+        (ix.files.clone(), ix.generation, ix.rx.is_some())
     }
 
     pub fn expand_to(&mut self, path: &Path) {
@@ -106,7 +154,33 @@ impl FileTree {
             .unwrap_or_else(|| root.display().to_string());
         let resp = ui.label(RichText::new(root_name).strong());
         resp.context_menu(|ui| dir_menu(ui, &root, &mut action, true));
-        self.show_dir(ui, &root, 0, active, theme, &mut action);
+
+        // Flatten the expanded part of the tree, then draw only the rows in
+        // view: a folder with thousands of files costs nothing when scrolled away.
+        let mut rows: Vec<(usize, Entry)> = Vec::new();
+        self.collect_rows(&root, 0, &mut rows);
+        let pitch = if self.row_pitch > 0.0 { self.row_pitch } else { ui.spacing().interact_size.y + ui.spacing().item_spacing.y };
+        let top = ui.cursor().top();
+        let clip = ui.clip_rect();
+        let first = (((clip.top() - top) / pitch).floor().max(0.0) as usize).min(rows.len());
+        let last = ((((clip.bottom() - top) / pitch).ceil().max(0.0)) as usize + 1).clamp(first, rows.len());
+        if first > 0 {
+            ui.add_space(first as f32 * pitch);
+        }
+        let start_y = ui.cursor().top();
+        for (depth, e) in &rows[first..last] {
+            self.show_row(ui, e, *depth, active, theme, &mut action);
+        }
+        if last > first + 1 {
+            let measured = (ui.cursor().top() - start_y) / (last - first) as f32;
+            if measured > 1.0 && (measured - self.row_pitch).abs() > 0.01 {
+                self.row_pitch = measured;
+                ui.ctx().request_repaint();
+            }
+        }
+        if rows.len() > last {
+            ui.add_space((rows.len() - last) as f32 * pitch);
+        }
         // Empty space below the tree also gets the root context menu.
         let rest = ui.allocate_response(
             egui::vec2(ui.available_width(), ui.available_height().max(40.0)),
@@ -116,74 +190,72 @@ impl FileTree {
         action
     }
 
-    fn show_dir(
-        &mut self,
-        ui: &mut Ui,
-        dir: &Path,
-        depth: usize,
-        active: Option<&Path>,
-        theme: &Theme,
-        action: &mut Option<TreeAction>,
-    ) {
+    fn collect_rows(&mut self, dir: &Path, depth: usize, rows: &mut Vec<(usize, Entry)>) {
         let entries = self.entries(dir).to_vec();
         for e in entries {
-            let indent = 14.0 * depth as f32;
-            if e.is_dir {
-                let open = self.expanded.contains(&e.path);
-                let resp = ui
-                    .horizontal(|ui| {
-                        ui.add_space(indent);
-                        ui.add(
-                            egui::Button::selectable(false, format!("    {}", e.name))
-                                .frame_when_inactive(false),
-                        )
-                    })
-                    .inner;
-                paint_disclosure(ui, resp.rect, open, theme.punct);
-                if resp.clicked() {
-                    if open {
-                        self.expanded.remove(&e.path);
-                    } else {
-                        self.expanded.insert(e.path.clone());
-                    }
-                }
-                resp.context_menu(|ui| dir_menu(ui, &e.path, action, false));
+            let open = e.is_dir && self.expanded.contains(&e.path);
+            let path = e.path.clone();
+            rows.push((depth, e));
+            if open {
+                self.collect_rows(&path, depth + 1, rows);
+            }
+        }
+    }
+
+    fn show_row(&mut self, ui: &mut Ui, e: &Entry, depth: usize, active: Option<&Path>, theme: &Theme, action: &mut Option<TreeAction>) {
+        let indent = 14.0 * depth as f32;
+        if e.is_dir {
+            let open = self.expanded.contains(&e.path);
+            let resp = ui
+                .horizontal(|ui| {
+                    ui.add_space(indent);
+                    ui.add(
+                        egui::Button::selectable(false, format!("    {}", e.name))
+                            .frame_when_inactive(false),
+                    )
+                })
+                .inner;
+            paint_disclosure(ui, resp.rect, open, theme.punct);
+            if resp.clicked() {
                 if open {
-                    self.show_dir(ui, &e.path, depth + 1, active, theme, action);
+                    self.expanded.remove(&e.path);
+                } else {
+                    self.expanded.insert(e.path.clone());
                 }
-            } else {
-                let selected = active == Some(e.path.as_path());
-                let color = file_color(&e.name, theme);
-                let text = RichText::new(format!("    {}", e.name)).color(color);
-                let resp = ui
-                    .horizontal(|ui| {
-                        ui.add_space(indent);
-                        ui.add(egui::Button::selectable(selected, text).frame_when_inactive(false))
-                    })
-                    .inner;
-                if resp.clicked() {
+            }
+            resp.context_menu(|ui| dir_menu(ui, &e.path, action, false));
+        } else {
+            let selected = active == Some(e.path.as_path());
+            let color = file_color(&e.name, theme);
+            let text = RichText::new(format!("    {}", e.name)).color(color);
+            let resp = ui
+                .horizontal(|ui| {
+                    ui.add_space(indent);
+                    ui.add(egui::Button::selectable(selected, text).frame_when_inactive(false))
+                })
+                .inner;
+            if resp.clicked() {
+                *action = Some(TreeAction::Open(e.path.clone()));
+            }
+            resp.context_menu(|ui| {
+                if ui.button("Open").clicked() {
                     *action = Some(TreeAction::Open(e.path.clone()));
                 }
-                resp.context_menu(|ui| {
-                    if ui.button("Open").clicked() {
-                        *action = Some(TreeAction::Open(e.path.clone()));
-                    }
-                    ui.separator();
-                    if ui.button("Rename…").clicked() {
-                        *action = Some(TreeAction::Rename(e.path.clone()));
-                    }
-                    if ui.button("Move to Trash").clicked() {
-                        *action = Some(TreeAction::Delete(e.path.clone()));
-                    }
-                    ui.separator();
-                    if ui.button("Copy Path").clicked() {
-                        *action = Some(TreeAction::CopyPath(e.path.clone()));
-                    }
-                    if ui.button(reveal_label()).clicked() {
-                        *action = Some(TreeAction::Reveal(e.path.clone()));
-                    }
-                });
-            }
+                ui.separator();
+                if ui.button("Rename…").clicked() {
+                    *action = Some(TreeAction::Rename(e.path.clone()));
+                }
+                if ui.button("Move to Trash").clicked() {
+                    *action = Some(TreeAction::Delete(e.path.clone()));
+                }
+                ui.separator();
+                if ui.button("Copy Path").clicked() {
+                    *action = Some(TreeAction::CopyPath(e.path.clone()));
+                }
+                if ui.button(reveal_label()).clicked() {
+                    *action = Some(TreeAction::Reveal(e.path.clone()));
+                }
+            });
         }
     }
 }
@@ -274,7 +346,7 @@ pub fn reveal_in_file_manager(path: &Path) {
 // ---------------------------------------------------------------------------
 // Listing files
 
-pub const MAX_LISTED_FILES: usize = 50_000;
+pub const MAX_LISTED_FILES: usize = 300_000;
 
 /// All files under `root` (relative paths), skipping hidden and vendor dirs.
 pub fn list_files(root: &Path) -> Vec<PathBuf> {
@@ -312,6 +384,9 @@ pub fn list_files(root: &Path) -> Vec<PathBuf> {
 pub fn fuzzy_score(candidate: &str, query: &str) -> Option<i64> {
     if query.is_empty() {
         return Some(0);
+    }
+    if candidate.is_ascii() && query.is_ascii() {
+        return fuzzy_score_ascii(candidate.as_bytes(), query.as_bytes());
     }
     let cand: Vec<char> = candidate.chars().collect();
     let cand_lower: Vec<char> = candidate.to_lowercase().chars().collect();
@@ -356,6 +431,36 @@ pub fn fuzzy_score(candidate: &str, query: &str) -> Option<i64> {
     Some(score)
 }
 
+/// [`fuzzy_score`] for ASCII strings, without allocating (quick open scores
+/// every file in the project on each keystroke).
+fn fuzzy_score_ascii(cand: &[u8], query: &[u8]) -> Option<i64> {
+    let file_start = cand.iter().rposition(|&c| c == b'/' || c == b'\\').map_or(0, |p| p + 1);
+    let mut score = 0i64;
+    let mut ci = 0usize;
+    let mut last_match: Option<usize> = None;
+    for &q in query {
+        if q == b' ' {
+            continue;
+        }
+        let qc = q.to_ascii_lowercase();
+        let i = ci + cand[ci..].iter().position(|c| c.to_ascii_lowercase() == qc)?;
+        score += 10;
+        if last_match == Some(i.wrapping_sub(1)) {
+            score += 15;
+        }
+        if i == 0 || matches!(cand[i - 1], b'/' | b'\\' | b'_' | b'-' | b'.' | b' ') {
+            score += 20;
+        }
+        if i >= file_start {
+            score += 10;
+        }
+        last_match = Some(i);
+        ci = i + 1;
+    }
+    score -= cand.len() as i64 / 4;
+    Some(score)
+}
+
 // ---------------------------------------------------------------------------
 // Find in files
 
@@ -371,7 +476,7 @@ pub struct SearchHit {
 #[allow(dead_code)]
 pub struct SearchJob {
     pub query: String,
-    pub rx: mpsc::Receiver<SearchHit>,
+    pub rx: mpsc::Receiver<Vec<SearchHit>>,
     pub cancel: Arc<AtomicBool>,
     pub hits: Vec<SearchHit>,
     pub done: Arc<AtomicBool>,
@@ -386,57 +491,42 @@ impl SearchJob {
         let done = Arc::new(AtomicBool::new(false));
         let (c2, d2, q2) = (cancel.clone(), done.clone(), query.clone());
         std::thread::spawn(move || {
-            let mut sent = 0;
-            'files: for rel in list_files(&root) {
-                if c2.load(Ordering::Relaxed) {
-                    break;
-                }
-                let path = root.join(&rel);
-                let Ok(meta) = std::fs::metadata(&path) else { continue };
-                if meta.len() > 4 * 1024 * 1024 {
-                    continue;
-                }
-                let Ok(bytes) = std::fs::read(&path) else { continue };
-                if bytes[..bytes.len().min(8192)].contains(&0) {
-                    continue;
-                }
-                let text = String::from_utf8_lossy(&bytes);
-                let ranges = crate::find::find_all(&text, &q2, case_sensitive, whole_word);
-                if ranges.is_empty() {
-                    continue;
-                }
-                let mut line = 0;
-                let mut line_start = 0;
-                let mut scanned = 0;
-                for r in ranges {
-                    for (i, b) in text.as_bytes()[scanned..r.start].iter().enumerate() {
-                        if *b == b'\n' {
-                            line += 1;
-                            line_start = scanned + i + 1;
+            // List files, then search them on all cores. Each worker sends a
+            // file's hits together, so results stay grouped by file.
+            let files = list_files(&root);
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let sent = std::sync::atomic::AtomicUsize::new(0);
+            let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 16);
+            std::thread::scope(|scope| {
+                for _ in 0..threads {
+                    scope.spawn(|| {
+                        loop {
+                            if c2.load(Ordering::Relaxed) || sent.load(Ordering::Relaxed) >= MAX_HITS {
+                                break;
+                            }
+                            let i = next.fetch_add(1, Ordering::Relaxed);
+                            let Some(rel) = files.get(i) else { break };
+                            let path = root.join(rel);
+                            let hits = search_file(&path, &q2, case_sensitive, whole_word);
+                            if hits.is_empty() {
+                                continue;
+                            }
+                            let n = hits.len();
+                            let before = sent.fetch_add(n, Ordering::Relaxed);
+                            if before >= MAX_HITS {
+                                break;
+                            }
+                            let mut hits = hits;
+                            hits.truncate(n.min(MAX_HITS - before));
+                            if tx.send(hits).is_err() {
+                                c2.store(true, Ordering::Relaxed);
+                                break;
+                            }
+                            ctx.request_repaint();
                         }
-                    }
-                    scanned = r.start;
-                    let line_end = text[r.start..].find('\n').map(|p| p + r.start).unwrap_or(text.len());
-                    let line_text: String = text[line_start..line_end].trim_end_matches('\r').chars().take(300).collect();
-                    let col = text[line_start..r.start].chars().count();
-                    if tx
-                        .send(SearchHit {
-                            path: path.clone(),
-                            line,
-                            col,
-                            line_text,
-                        })
-                        .is_err()
-                    {
-                        break 'files;
-                    }
-                    sent += 1;
-                    if sent >= MAX_HITS {
-                        break 'files;
-                    }
+                    });
                 }
-                ctx.request_repaint();
-            }
+            });
             d2.store(true, Ordering::Relaxed);
             ctx.request_repaint();
         });
@@ -451,13 +541,48 @@ impl SearchJob {
 
     pub fn poll(&mut self) {
         while let Ok(h) = self.rx.try_recv() {
-            self.hits.push(h);
+            self.hits.extend(h);
         }
     }
 
     pub fn is_done(&self) -> bool {
         self.done.load(Ordering::Relaxed)
     }
+}
+
+/// All matches of `query` in one file (skipping big and binary files).
+fn search_file(path: &Path, query: &str, case_sensitive: bool, whole_word: bool) -> Vec<SearchHit> {
+    let mut out = Vec::new();
+    let Ok(meta) = std::fs::metadata(path) else { return out };
+    if meta.len() > 4 * 1024 * 1024 {
+        return out;
+    }
+    let Ok(bytes) = std::fs::read(path) else { return out };
+    if bytes[..bytes.len().min(8192)].contains(&0) {
+        return out;
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    let ranges = crate::find::find_all(&text, query, case_sensitive, whole_word);
+    let mut line = 0;
+    let mut line_start = 0;
+    let mut scanned = 0;
+    for r in ranges {
+        for (i, b) in text.as_bytes()[scanned..r.start].iter().enumerate() {
+            if *b == b'\n' {
+                line += 1;
+                line_start = scanned + i + 1;
+            }
+        }
+        scanned = r.start;
+        let line_end = text[r.start..].find('\n').map(|p| p + r.start).unwrap_or(text.len());
+        let line_text: String = text[line_start..line_end].trim_end_matches('\r').chars().take(300).collect();
+        let col = text[line_start..r.start].chars().count();
+        out.push(SearchHit { path: path.to_path_buf(), line, col, line_text });
+        if out.len() >= MAX_HITS {
+            break;
+        }
+    }
+    out
 }
 
 impl Drop for SearchJob {

@@ -1,8 +1,8 @@
 //! Fast, dependency-free syntax highlighting for C, Objective-C, GLSL and Makefiles.
 //!
-//! The lexers are hand-written and run over the whole buffer. They are
-//! designed to be cheap enough to rerun on every edit (a 100k line file
-//! lexes in a few milliseconds).
+//! The lexers are hand-written and work line by line: each line is lexed
+//! from the [`LineState`] the previous line ended in, so the editor only
+//! lexes the lines it shows (plus the states of the lines above them).
 
 use std::ops::Range;
 use std::path::Path;
@@ -91,89 +91,123 @@ pub enum Tok {
 
 pub type Spans = Vec<(Range<usize>, Tok)>;
 
-pub fn tokenize(lang: Language, text: &str) -> Spans {
+/// Lexer state carried from the end of one line to the start of the next.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum LineState {
+    #[default]
+    Normal,
+    /// Inside a `/* ... */` comment.
+    BlockComment,
+    /// A `//` comment whose line ended with a backslash.
+    LineCommentCont,
+    /// Makefile: the previous line ended with a backslash.
+    MakeCont,
+}
+
+/// Lex one line, `range` (without its newline), starting in `state`.
+/// Spans are appended to `out` with absolute byte offsets; returns the state
+/// at the start of the next line.
+pub fn lex_line(lang: Language, text: &str, range: Range<usize>, state: LineState, out: &mut Spans) -> LineState {
+    let mut b = SpanBuilder { spans: std::mem::take(out), last_is_word: false };
+    let next = lex_line_into(lang, text, range, state, &mut b);
+    *out = b.spans;
+    next
+}
+
+fn lex_line_into(lang: Language, text: &str, range: Range<usize>, state: LineState, out: &mut SpanBuilder) -> LineState {
     match lang {
-        Language::C => lex_c_family(text, Dialect::C),
-        Language::ObjC => lex_c_family(text, Dialect::ObjC),
-        Language::Glsl => lex_c_family(text, Dialect::Glsl),
-        Language::Make => lex_make(text),
-        Language::Plain => vec![(0..text.len(), Tok::Normal)],
+        Language::C => lex_c_line(text, range, Dialect::C, state, out),
+        Language::ObjC => lex_c_line(text, range, Dialect::ObjC, state, out),
+        Language::Glsl => lex_c_line(text, range, Dialect::Glsl, state, out),
+        Language::Make => lex_make_line(text, range, state, out),
+        Language::Plain => {
+            out.push(range, Tok::Normal);
+            LineState::Normal
+        }
     }
 }
 
-/// Build a layout job for `text`, with search matches given as byte ranges
-/// (sorted, non-overlapping) painted with a background colour.
-pub fn layout_job(
-    lang: Language,
+/// Lex a whole buffer (tests only; the editor lexes only the lines it
+/// shows, see [`lex_line`]).
+#[cfg(test)]
+pub fn tokenize(lang: Language, text: &str) -> Spans {
+    let b = text.as_bytes();
+    let mut out = SpanBuilder::new(text.len() / 4);
+    let mut state = LineState::Normal;
+    let mut i = 0;
+    loop {
+        let end = memchr_newline(b, i);
+        state = lex_line_into(lang, text, i..end, state, &mut out);
+        if end >= b.len() {
+            break;
+        }
+        out.push(end..end + 1, Tok::Normal);
+        i = end + 1;
+    }
+    out.spans
+}
+
+/// Build the layout job for the part `vis` of one line (`line` excludes the
+/// newline), given its lexed `spans` (absolute offsets). `overlays` are
+/// background colours over absolute byte ranges, painted in order (later
+/// ones win where they overlap).
+pub fn line_job(
     text: &str,
-    font: FontId,
-    theme: &Theme,
-    matches: &[Range<usize>],
-    current_match: Option<usize>,
+    vis: Range<usize>,
+    spans: &[(Range<usize>, Tok)],
     semantic: &[(Range<usize>, Tok)],
+    overlays: &[(Range<usize>, Color32)],
+    font: &FontId,
+    theme: &Theme,
 ) -> LayoutJob {
-    let mut spans = tokenize(lang, text);
-    apply_semantic(&mut spans, semantic);
     let mut job = LayoutJob::default();
-    job.text.reserve(text.len());
-    let mut mi = 0usize;
+    job.text.reserve(vis.len());
+    job.wrap.max_width = f32::INFINITY;
+    // Semantic tokens covering this line (sorted by start).
+    let first = spans.first().map(|s| s.0.start).unwrap_or(vis.start);
+    let mut si = semantic.partition_point(|(r, _)| r.start < first);
+    let mut cuts: Vec<usize> = Vec::new();
+    for (r, _) in overlays {
+        cuts.push(r.start);
+        cuts.push(r.end);
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
     for (range, tok) in spans {
-        let color = theme.token_color(tok);
-        let italic = tok == Tok::Comment && theme.italic_comments;
-        let mut start = range.start;
-        while start < range.end {
-            // Skip matches that end before this point.
-            while mi < matches.len() && matches[mi].end <= start {
-                mi += 1;
+        let start = range.start.max(vis.start);
+        let end = range.end.min(vis.end);
+        if start >= end {
+            continue;
+        }
+        let mut tok = *tok;
+        if matches!(tok, Tok::Normal | Tok::Function | Tok::Constant | Tok::Type) {
+            while si < semantic.len() && semantic[si].0.start < range.start {
+                si += 1;
             }
-            let (end, bg) = if mi < matches.len() && matches[mi].start <= start {
-                let bg = if Some(mi) == current_match {
-                    theme.current_match_bg
-                } else {
-                    theme.match_bg
-                };
-                (matches[mi].end.min(range.end), bg)
-            } else if mi < matches.len() && matches[mi].start < range.end {
-                (matches[mi].start, Color32::TRANSPARENT)
-            } else {
-                (range.end, Color32::TRANSPARENT)
-            };
-            let format = TextFormat {
-                font_id: font.clone(),
-                color,
-                italics: italic,
-                background: bg,
-                ..Default::default()
-            };
-            job.append(&text[start..end], 0.0, format);
-            start = end;
+            if si < semantic.len() && semantic[si].0 == *range {
+                tok = semantic[si].1;
+            }
+        }
+        let color = theme.token_color(tok);
+        let italics = tok == Tok::Comment && theme.italic_comments;
+        let mut a = start;
+        while a < end {
+            let b = cuts.iter().copied().find(|&c| c > a).unwrap_or(end).min(end);
+            let mut background = Color32::TRANSPARENT;
+            for (r, c) in overlays {
+                if r.start <= a && a < r.end {
+                    background = *c;
+                }
+            }
+            job.append(
+                &text[a..b],
+                0.0,
+                TextFormat { font_id: font.clone(), color, italics, background, ..Default::default() },
+            );
+            a = b;
         }
     }
     job
-}
-
-/// Recolour identifiers using semantic tokens from the language server.
-/// Only tokens that exactly cover one identifier span are applied, so stale
-/// tokens (from an older version of the text) can't corrupt highlighting.
-fn apply_semantic(spans: &mut Spans, semantic: &[(Range<usize>, Tok)]) {
-    if semantic.is_empty() {
-        return;
-    }
-    let mut si = 0;
-    for (range, tok) in spans.iter_mut() {
-        if !matches!(*tok, Tok::Normal | Tok::Function | Tok::Constant | Tok::Type) {
-            continue;
-        }
-        while si < semantic.len() && semantic[si].0.start < range.start {
-            si += 1;
-        }
-        if si >= semantic.len() {
-            break;
-        }
-        if semantic[si].0 == *range {
-            *tok = semantic[si].1;
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -268,6 +302,7 @@ struct SpanBuilder {
 }
 
 impl SpanBuilder {
+    #[cfg(test)]
     fn new(cap: usize) -> Self {
         Self { spans: Vec::with_capacity(cap), last_is_word: false }
     }
@@ -349,24 +384,45 @@ fn classify_c_ident(word: &str, dialect: Dialect) -> Option<Tok> {
     None
 }
 
-fn lex_c_family(text: &str, dialect: Dialect) -> Spans {
+/// Whether the line `start..end` ends with a backslash (ignoring a `\r`).
+fn ends_with_backslash(b: &[u8], start: usize, end: usize) -> bool {
+    let mut e = end;
+    if e > start && b[e - 1] == b'\r' {
+        e -= 1;
+    }
+    e > start && b[e - 1] == b'\\'
+}
+
+fn lex_c_line(text: &str, range: Range<usize>, dialect: Dialect, state: LineState, out: &mut SpanBuilder) -> LineState {
     let b = text.as_bytes();
-    let n = b.len();
-    let mut out = SpanBuilder::new(n / 4);
-    let mut i = 0;
-    let mut line_start = true; // only whitespace seen since the last newline
+    let n = range.end;
+    let mut i = range.start;
+    let mut line_start = true; // only whitespace seen since the line started
     let mut in_include = false; // inside `#include` line: treat <...> as string
+
+    match state {
+        LineState::BlockComment => {
+            let mut j = i;
+            while j < n && !(b[j] == b'*' && j + 1 < n && b[j + 1] == b'/') {
+                j += 1;
+            }
+            if j >= n {
+                out.push(i..n, Tok::Comment);
+                return LineState::BlockComment;
+            }
+            out.push(i..j + 2, Tok::Comment);
+            i = j + 2;
+            line_start = false;
+        }
+        LineState::LineCommentCont => {
+            out.push(i..n, Tok::Comment);
+            return if ends_with_backslash(b, i, n) { LineState::LineCommentCont } else { LineState::Normal };
+        }
+        _ => {}
+    }
 
     while i < n {
         let c = b[i];
-        // Newline
-        if c == b'\n' {
-            out.push(i..i + 1, Tok::Normal);
-            i += 1;
-            line_start = true;
-            in_include = false;
-            continue;
-        }
         if c == b' ' || c == b'\t' || c == b'\r' {
             out.push(i..i + 1, Tok::Normal);
             i += 1;
@@ -374,26 +430,20 @@ fn lex_c_family(text: &str, dialect: Dialect) -> Spans {
         }
         // Comments
         if c == b'/' && i + 1 < n && b[i + 1] == b'/' {
-            let mut j = i + 2;
-            while j < n && b[j] != b'\n' {
-                // Backslash line continuation continues the comment.
-                if b[j] == b'\\' && j + 1 < n && b[j + 1] == b'\n' {
-                    j += 2;
-                    continue;
-                }
-                j += 1;
-            }
-            out.push(i..j, Tok::Comment);
-            i = j;
-            line_start = false;
-            continue;
+            out.push(i..n, Tok::Comment);
+            // Backslash line continuation continues the comment.
+            return if ends_with_backslash(b, i, n) { LineState::LineCommentCont } else { LineState::Normal };
         }
         if c == b'/' && i + 1 < n && b[i + 1] == b'*' {
             let mut j = i + 2;
             while j < n && !(b[j] == b'*' && j + 1 < n && b[j + 1] == b'/') {
                 j += 1;
             }
-            j = (j + 2).min(n);
+            if j >= n {
+                out.push(i..n, Tok::Comment);
+                return LineState::BlockComment;
+            }
+            j += 2;
             out.push(i..j, Tok::Comment);
             i = j;
             line_start = false;
@@ -554,7 +604,7 @@ fn lex_c_family(text: &str, dialect: Dialect) -> Spans {
         out.push(i..i + 1, tok);
         i += 1;
     }
-    out.spans
+    LineState::Normal
 }
 
 // ---------------------------------------------------------------------------
@@ -594,60 +644,52 @@ fn make_var_end(b: &[u8], i: usize) -> usize {
     j
 }
 
-fn lex_make(text: &str) -> Spans {
+fn lex_make_line(text: &str, range: Range<usize>, state: LineState, out: &mut SpanBuilder) -> LineState {
     let b = text.as_bytes();
-    let n = b.len();
-    let mut out = SpanBuilder::new(n / 8);
-    let mut i = 0;
-    let mut continued = false; // previous line ended with a backslash
-    while i < n {
-        let line_end = memchr_newline(b, i);
-        let line = &text[i..line_end];
-        let recipe = b[i] == b'\t';
-        let was_continued = continued;
-        continued = line.ends_with('\\');
+    let i = range.start;
+    let line_end = range.end;
+    let line = &text[i..line_end];
+    let recipe = i < line_end && b[i] == b'\t';
+    let was_continued = state == LineState::MakeCont;
+    let continued = line.trim_end_matches('\r').ends_with('\\');
 
-        // Find the first non-space word to detect directives and assignments.
-        let trimmed_off = line.len() - line.trim_start().len();
-        let first_word_end = line[trimmed_off..]
-            .find(|ch: char| ch.is_whitespace())
-            .map(|p| p + trimmed_off)
-            .unwrap_or(line.len());
-        let first_word = &line[trimmed_off..first_word_end];
+    // Find the first non-space word to detect directives and assignments.
+    let trimmed_off = line.len() - line.trim_start().len();
+    let first_word_end = line[trimmed_off..]
+        .find(|ch: char| ch.is_whitespace())
+        .map(|p| p + trimmed_off)
+        .unwrap_or(line.len());
+    let first_word = &line[trimmed_off..first_word_end];
 
-        let mut pos = i;
-        if !recipe && !was_continued && MAKE_DIRECTIVES.contains(&first_word) {
-            out.push(i..i + first_word_end, Tok::Keyword);
-            pos = i + first_word_end;
-        } else if !recipe && !was_continued && !line.trim_start().starts_with('#') {
-            // Assignment or rule?
-            if let Some(op) = find_make_operator(line) {
-                let (op_pos, op_len, is_rule) = op;
-                let head = i..i + op_pos;
-                if is_rule {
-                    let name = line[..op_pos].trim();
-                    let tok = if name.starts_with('.') && name.chars().all(|c| c.is_ascii_uppercase() || c == '.' || c == '_') {
-                        Tok::Keyword
-                    } else {
-                        Tok::Target
-                    };
-                    lex_make_segment(text, b, head, tok, &mut out);
+    let mut pos = i;
+    if !recipe && !was_continued && MAKE_DIRECTIVES.contains(&first_word) {
+        out.push(i..i + first_word_end, Tok::Keyword);
+        pos = i + first_word_end;
+    } else if !recipe && !was_continued && !line.trim_start().starts_with('#') {
+        // Assignment or rule?
+        if let Some(op) = find_make_operator(line) {
+            let (op_pos, op_len, is_rule) = op;
+            let head = i..i + op_pos;
+            if is_rule {
+                let name = line[..op_pos].trim();
+                let tok = if name.starts_with('.') && name.chars().all(|c| c.is_ascii_uppercase() || c == '.' || c == '_') {
+                    Tok::Keyword
                 } else {
-                    lex_make_segment(text, b, head, Tok::Variable, &mut out);
-                }
-                out.push(i + op_pos..i + op_pos + op_len, Tok::Punct);
-                pos = i + op_pos + op_len;
+                    Tok::Target
+                };
+                lex_make_segment(text, b, head, tok, out);
+            } else {
+                lex_make_segment(text, b, head, Tok::Variable, out);
             }
+            out.push(i + op_pos..i + op_pos + op_len, Tok::Punct);
+            pos = i + op_pos + op_len;
         }
-        lex_make_segment(text, b, pos..line_end, Tok::Normal, &mut out);
-        if line_end < n {
-            out.push(line_end..line_end + 1, Tok::Normal);
-        }
-        i = line_end + 1;
     }
-    out.spans
+    lex_make_segment(text, b, pos..line_end, Tok::Normal, out);
+    if continued { LineState::MakeCont } else { LineState::Normal }
 }
 
+#[cfg(test)]
 fn memchr_newline(b: &[u8], from: usize) -> usize {
     b[from..]
         .iter()
@@ -824,7 +866,10 @@ mod tests {
     fn match_overlay() {
         let theme = Theme::dark();
         let src = "int abc = abc;";
-        let job = layout_job(Language::C, src, FontId::monospace(12.0), &theme, &[4..7, 10..13], Some(1), &[]);
+        let mut spans = Vec::new();
+        lex_line(Language::C, src, 0..src.len(), LineState::Normal, &mut spans);
+        let bg = Color32::RED;
+        let job = line_job(src, 0..src.len(), &spans, &[], &[(4..7, bg), (10..13, bg)], &FontId::monospace(12.0), &theme);
         assert_eq!(job.text, src);
         let bgs: Vec<_> = job
             .sections
@@ -833,5 +878,29 @@ mod tests {
             .map(|s| &src[s.byte_range.start.0..s.byte_range.end.0])
             .collect();
         assert_eq!(bgs, vec!["abc", "abc"]);
+    }
+
+    #[test]
+    fn line_by_line_matches_whole_buffer() {
+        let src = "a /* one\ntwo */ b\n// c \\\ncontinued\nint x; \"s\"\n";
+        let whole = tokenize(Language::C, src);
+        let mut state = LineState::Normal;
+        let mut i = 0;
+        for line in src.split_inclusive('\n') {
+            let end = i + line.trim_end_matches('\n').len();
+            let mut spans = Vec::new();
+            state = lex_line(Language::C, src, i..end, state, &mut spans);
+            for (r, t) in spans {
+                for b in r {
+                    let w = whole.iter().find(|(wr, _)| wr.contains(&b)).unwrap().1;
+                    assert_eq!(w, t, "byte {b}");
+                }
+            }
+            i += line.len();
+        }
+        let comment_at = |s: &str| whole.iter().find(|(r, _)| r.contains(&src.find(s).unwrap())).unwrap().1;
+        assert_eq!(comment_at("two"), Tok::Comment);
+        assert_eq!(comment_at("continued"), Tok::Comment);
+        assert_eq!(comment_at("int"), Tok::Type);
     }
 }

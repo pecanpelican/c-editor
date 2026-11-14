@@ -8,7 +8,7 @@ use std::sync::mpsc;
 
 use egui::{Key, Modifiers, RichText};
 
-use super::{App, BottomTab, Modal};
+use super::{App, BottomTab};
 use crate::highlight::Tok;
 use crate::lsp::{self, CodeAction, CompletionItem, Event, SemKind, Server, ServerKind, Signature, Symbol};
 use crate::make::{Diagnostic, Severity};
@@ -70,6 +70,8 @@ pub(super) struct RefHit {
     pub line: usize,
     pub col: usize,
     pub text: String,
+    /// Definition, call, write... when it could be worked out.
+    pub kind: Option<crate::refactor::UseKind>,
 }
 
 #[derive(Default)]
@@ -101,6 +103,8 @@ pub(super) struct LspState {
     /// restart clangd when they change.
     config_stamp: Option<(u64, u64)>,
     config_checked_at: f64,
+    /// When to re-send every open file after a multi-file edit.
+    nudge_at: Option<f64>,
 }
 
 /// Hash of the modification times of clangd's settings files that apply to
@@ -318,6 +322,15 @@ impl App {
             self.lsp.seen.retain(|p, _| ServerKind::for_path(p) != Some(kind));
         }
 
+        if self.lsp.nudge_at.is_some_and(|t| now >= t) {
+            self.lsp.nudge_at = None;
+            for d in &mut self.docs {
+                if d.path.as_deref().and_then(ServerKind::for_path).is_some() {
+                    d.version += 1;
+                }
+            }
+        }
+
         // Sync documents (debounced while typing).
         let open_paths: HashSet<PathBuf> = self.docs.iter().filter_map(|d| d.path.clone()).collect();
         let force_id = self.lsp.completion.as_ref().filter(|c| c.loading).map(|c| c.doc_id);
@@ -406,7 +419,7 @@ impl App {
         }
     }
 
-    fn handle_lsp_event(&mut self, ctx: &egui::Context, e: Event) {
+    pub(super) fn handle_lsp_event(&mut self, ctx: &egui::Context, e: Event) {
         match e {
             Event::Diagnostics { path, mut diags } => {
                 let utf8 = self.lsp.server_for(&path).map(|s| s.utf8).unwrap_or(false);
@@ -415,10 +428,16 @@ impl App {
                 for d in &mut diags {
                     d.message = d.message.replace("(fix available)", &fix_hint);
                 }
-                if let Some(doc) = self.docs.iter().find(|d| d.path.as_deref() == Some(path.as_path())) {
+                if let Some(doc) = self.docs.iter_mut().find(|d| d.path.as_deref() == Some(path.as_path())) {
+                    doc.sync();
                     for d in &mut diags {
-                        let b = lsp::position_to_byte(&doc.text, d.line as u32, d.col as u32, utf8);
-                        d.col = textops::line_col(&doc.text, b).1;
+                        if d.line >= doc.index.line_count() {
+                            continue;
+                        }
+                        let r = doc.index.line_range(d.line);
+                        let line = &doc.text[r];
+                        let b = lsp::position_to_byte(line, 0, d.col as u32, utf8);
+                        d.col = line[..b].chars().count();
                     }
                 }
                 if diags.is_empty() {
@@ -447,22 +466,35 @@ impl App {
             }
             Event::References { locations, utf8 } => {
                 let mut hits = Vec::new();
-                let mut cache: HashMap<PathBuf, String> = HashMap::new();
+                // Group by file so each file is read and tokenized once.
+                let mut by_file: Vec<(PathBuf, Vec<lsp::Location>)> = Vec::new();
                 for l in locations {
+                    match by_file.iter_mut().find(|(p, _)| *p == l.path) {
+                        Some((_, v)) => v.push(l),
+                        None => by_file.push((l.path.clone(), vec![l])),
+                    }
+                }
+                for (path, locs) in by_file {
                     let text = self
                         .docs
                         .iter()
-                        .find(|d| d.path.as_deref() == Some(l.path.as_path()))
+                        .find(|d| d.path.as_deref() == Some(path.as_path()))
                         .map(|d| d.text.clone())
-                        .or_else(|| cache.get(&l.path).cloned())
-                        .or_else(|| std::fs::read_to_string(&l.path).ok())
+                        .or_else(|| std::fs::read_to_string(&path).ok())
                         .unwrap_or_default();
-                    cache.insert(l.path.clone(), text.clone());
-                    let b = lsp::position_to_byte(&text, l.line, l.character, utf8);
-                    let (line, col) = textops::line_col(&text, b);
-                    let ls = textops::line_start(&text, b);
-                    let le = textops::line_end(&text, b);
-                    hits.push(RefHit { path: l.path, line, col, text: text[ls..le].trim().to_string() });
+                    let c_like = ServerKind::for_path(&path) == Some(ServerKind::Clangd);
+                    let src = c_like.then(|| crate::refactor::Src::new(&text));
+                    let mut file_hits = Vec::new();
+                    for l in locs {
+                        let b = lsp::position_to_byte(&text, l.line, l.character, utf8);
+                        let (line, col) = textops::line_col(&text, b);
+                        let ls = textops::line_start(&text, b);
+                        let le = textops::line_end(&text, b);
+                        let kind = src.as_ref().and_then(|s| crate::refactor::classify(s, b));
+                        file_hits.push(RefHit { path: l.path, line, col, text: text[ls..le].trim().to_string(), kind });
+                    }
+                    file_hits.sort_by_key(|h| (h.line, h.col));
+                    hits.extend(file_hits);
                 }
                 let n = hits.len();
                 self.lsp.references = hits;
@@ -482,6 +514,9 @@ impl App {
                 }
             }
             Event::CodeActions { mut actions, utf8 } => {
+                if self.take_extract_variable(ctx, &actions, utf8) {
+                    return;
+                }
                 let Some(doc) = self.docs.get(self.active) else { return };
                 if actions.is_empty() {
                     self.toast(ctx, "No quick fixes or refactorings here", false);
@@ -513,6 +548,10 @@ impl App {
                 }
             }
             Event::Edits { edits, utf8, what } => {
+                if self.should_preview(what, &edits) {
+                    self.preview_edits(what, edits, utf8);
+                    return;
+                }
                 let mut files = 0;
                 for (path, list) in edits {
                     let then_save = what == "Format" && self.save_after_format.remove(&path).is_some();
@@ -545,16 +584,27 @@ impl App {
                         self.save_doc_now(ctx, i);
                     }
                 }
-                if what == "Rename" {
-                    self.toast(ctx, format!("Renamed in {files} file{} (not saved yet)", if files == 1 { "" } else { "s" }), false);
+                if files > 1 {
+                    // clangd doesn't re-check open files when a header they
+                    // include changes in memory; nudge them once the edited
+                    // files have been sent.
+                    self.lsp.nudge_at = Some(ctx.input(|i| i.time) + 0.8);
+                    ctx.request_repaint_after(std::time::Duration::from_millis(900));
                 }
+                let s = if files == 1 { "" } else { "s" };
+                match what {
+                    "Rename" => self.toast(ctx, format!("Renamed in {files} file{s}"), false),
+                    "Format" | "Fix" => {}
+                    _ => self.toast(ctx, format!("{what}: changed {files} file{s}"), false),
+                }
+                self.after_edits(ctx);
             }
             Event::SemanticTokens { path, version, tokens, utf8 } => {
                 if let Some(doc) = self.docs.iter_mut().find(|d| d.path.as_deref() == Some(path.as_path()))
                     && doc.version == version
                 {
+                    doc.sync();
                     let mut out = Vec::with_capacity(tokens.len());
-                    let mut line_cache = (u32::MAX, 0usize);
                     for t in tokens {
                         let tok = match t.kind {
                             SemKind::Type => Tok::Type,
@@ -562,11 +612,11 @@ impl App {
                             SemKind::Macro | SemKind::Constant => Tok::Constant,
                             _ => continue,
                         };
-                        if line_cache.0 != t.line {
-                            line_cache = (t.line, textops::line_to_byte(&doc.text, t.line as usize));
+                        if t.line as usize >= doc.index.line_count() {
+                            continue;
                         }
-                        let ls = line_cache.1;
-                        let le = textops::line_end(&doc.text, ls);
+                        let ls = doc.index.line_start(t.line as usize);
+                        let le = doc.index.line_end(t.line as usize);
                         let line = &doc.text[ls..le];
                         let (s, e) = if utf8 {
                             (t.start as usize, (t.start + t.len) as usize)
@@ -588,6 +638,9 @@ impl App {
                 Some(p) => self.open_file(&p),
                 None => self.switch_header_fallback(ctx),
             },
+            Event::PrepareRename { req, result } => self.on_prepare_rename(ctx, req, result),
+            Event::RefsFor { req, locations, utf8 } => self.on_refs_for(ctx, req, locations, utf8),
+            Event::Calls { req, items } => self.on_calls(ctx, req, items),
             Event::Status(s) => self.lsp.status = s,
             Event::Exited(kind, s) => {
                 self.lsp.status = s;
@@ -597,7 +650,7 @@ impl App {
         }
     }
 
-    fn jump_to_location(&mut self, path: &Path, line: u32, character: u32, utf8: bool, record: bool) {
+    pub(super) fn jump_to_location(&mut self, path: &Path, line: u32, character: u32, utf8: bool, record: bool) {
         if record && let Some(doc) = self.docs.get(self.active) && let Some(p) = &doc.path {
             let ctx_sel = doc.cursor_line_col;
             let b = textops::line_col_to_byte(&doc.text, ctx_sel.0, ctx_sel.1);
@@ -628,7 +681,7 @@ impl App {
     }
 
     /// Run `f` with the active document's server and LSP position of the cursor.
-    fn with_server_at_cursor(&mut self, ctx: &egui::Context, f: impl FnOnce(&mut Server, &Path, (u32, u32))) -> bool {
+    pub(super) fn with_server_at_cursor(&mut self, ctx: &egui::Context, f: impl FnOnce(&mut Server, &Path, (u32, u32))) -> bool {
         let Some(doc) = self.docs.get(self.active) else { return false };
         let Some(path) = doc.path.clone() else { return false };
         let sel = doc.selection(ctx);
@@ -654,11 +707,7 @@ impl App {
         {
             // Put the cursor where the user clicked first.
             doc.pending_select = Some(b..b);
-            let id = doc.text_edit_id();
-            let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
-            let ci = textops::byte_to_char(&doc.text, b);
-            state.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(ci))));
-            egui::TextEdit::store_state(ctx, id, state);
+            doc.set_selection(b..b);
         }
         self.with_server_at_cursor(ctx, |s, p, pos| s.definition(p, pos));
     }
@@ -681,7 +730,7 @@ impl App {
         });
     }
 
-    fn apply_code_action(&mut self, ctx: &egui::Context, a: CodeAction, utf8: bool) {
+    pub(super) fn apply_code_action(&mut self, ctx: &egui::Context, a: CodeAction, utf8: bool) {
         if let Some(edits) = a.edit {
             self.handle_lsp_event(ctx, Event::Edits { edits, utf8, what: "Fix" });
         }
@@ -749,11 +798,16 @@ impl App {
             return;
         }
         let name = doc.text[w].to_string();
-        self.modal = Some(Modal::RenameSymbol { text: name, focus: true });
+        self.start_rename(ctx, name);
     }
 
-    pub(super) fn do_rename(&mut self, ctx: &egui::Context, new_name: String) {
+    /// Returns false if the name was refused (the rename box stays open).
+    pub(super) fn do_rename(&mut self, ctx: &egui::Context, new_name: String) -> bool {
+        if !self.check_new_name(ctx, &new_name) {
+            return false;
+        }
         self.with_server_at_cursor(ctx, |s, p, pos| s.rename(p, pos, &new_name));
+        true
     }
 
     pub(super) fn cmd_format(&mut self, ctx: &egui::Context) {
@@ -896,6 +950,9 @@ impl App {
 
     /// Keys for the completion popup; must run before the editor sees them.
     pub(super) fn completion_keys(&mut self, ctx: &egui::Context) {
+        if self.refactor_menu_keys(ctx) {
+            return;
+        }
         if let Some(m) = &mut self.lsp.actions {
             let n = m.items.len();
             let (mut pick, mut close) = (None, false);
@@ -1116,7 +1173,7 @@ impl App {
                         let mut job = egui::text::LayoutJob::default();
                         job.append(tag, 0.0, egui::TextFormat::simple(egui::FontId::monospace(11.5), theme.comment));
                         job.append(&a.title, 0.0, egui::TextFormat::simple(egui::FontId::proportional(13.5), color));
-                        if ui.add(egui::Button::selectable(i == m.selected, job).frame_when_inactive(false)).clicked() {
+                        if ui.add(egui::Button::selectable(i == m.selected, job).frame_when_inactive(i == m.selected)).clicked() {
                             pick = Some(i);
                         }
                     }
@@ -1267,7 +1324,7 @@ impl App {
     pub(super) fn hover_ui(&mut self, ctx: &egui::Context) {
         let Some(h) = &self.lsp.hover else { return };
         let Some(text) = h.text.as_ref().filter(|t| !t.is_empty()) else { return };
-        if self.lsp.completion.is_some() {
+        if self.lsp.completion.is_some() || self.refactor_busy() {
             return;
         }
         let text = text.clone();
@@ -1291,15 +1348,43 @@ impl App {
             ui.label(RichText::new("Use Find References (Shift+F12) on a symbol.").weak());
             return;
         }
+        use crate::refactor::UseKind;
         let root = self.tree.as_ref().map(|t| t.root.clone());
         let theme = self.theme.clone();
         let mut open = None;
         let font = egui::FontId::monospace(12.5);
+        let refs = &self.lsp.references;
+        // Summary: how many of each kind, across how many files.
+        let mut files: Vec<&Path> = refs.iter().map(|r| r.path.as_path()).collect();
+        files.dedup();
+        let count = |k: UseKind| refs.iter().filter(|r| r.kind == Some(k)).count();
+        let mut parts = vec![format!("{} usage{} in {} file{}", refs.len(), if refs.len() == 1 { "" } else { "s" }, files.len(), if files.len() == 1 { "" } else { "s" })];
+        for k in [UseKind::Call, UseKind::Write, UseKind::Read, UseKind::Declaration, UseKind::Definition] {
+            let n = count(k);
+            if n > 0 {
+                parts.push(format!("{n} {}{}", k.label(), if n == 1 { "" } else { "s" }));
+            }
+        }
+        ui.label(RichText::new(parts.join(" · ")).color(theme.comment));
+        let tag_color = |k: Option<UseKind>| match k {
+            Some(UseKind::Write) => theme.warning,
+            Some(UseKind::Definition | UseKind::Declaration) => theme.keyword,
+            Some(UseKind::Call) => theme.function,
+            _ => theme.comment,
+        };
         egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
-            for (i, r) in self.lsp.references.iter().enumerate() {
-                let rel = root.as_ref().and_then(|x| r.path.strip_prefix(x).ok()).unwrap_or(&r.path);
+            let mut last: Option<&Path> = None;
+            for (i, r) in refs.iter().enumerate() {
+                if last != Some(r.path.as_path()) {
+                    last = Some(r.path.as_path());
+                    let rel = root.as_ref().and_then(|x| r.path.strip_prefix(x).ok()).unwrap_or(&r.path);
+                    let n = refs.iter().filter(|x| x.path == r.path).count();
+                    ui.label(RichText::new(format!("{}  ({n})", rel.display())).strong().color(theme.function));
+                }
                 let mut job = egui::text::LayoutJob::default();
-                job.append(&format!("{}:{}  ", rel.display(), r.line + 1), 0.0, egui::TextFormat::simple(font.clone(), theme.function));
+                job.append(&format!("{:>6}  ", r.line + 1), 0.0, egui::TextFormat::simple(font.clone(), theme.comment));
+                let tag = r.kind.map(|k| k.label()).unwrap_or("");
+                job.append(&format!("{tag:<11}  "), 0.0, egui::TextFormat::simple(egui::FontId::monospace(11.0), tag_color(r.kind)));
                 job.append(&r.text, 0.0, egui::TextFormat::simple(font.clone(), theme.text));
                 if ui.add(egui::Button::selectable(false, job).frame_when_inactive(false)).clicked() {
                     open = Some(i);

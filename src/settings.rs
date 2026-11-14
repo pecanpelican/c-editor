@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Settings {
-    /// "dark" or "light"
+    /// "system", "dark", "light", "midnight", "high-contrast" or "sepia"
     pub theme: String,
     pub font_size: f32,
     /// Path to a .ttf/.otf monospace font to use in the editor (empty = built-in).
@@ -19,6 +19,8 @@ pub struct Settings {
     pub format_on_save: bool,
     pub trim_trailing_whitespace: bool,
     pub ensure_final_newline: bool,
+    /// Type the closing bracket or quote when typing an opening one.
+    pub auto_close_brackets: bool,
     /// Override the clangd binary (empty = search PATH and common locations).
     pub clangd_path: String,
     /// Extra arguments for clangd, e.g. ["--clang-tidy"].
@@ -41,6 +43,7 @@ impl Default for Settings {
             format_on_save: false,
             trim_trailing_whitespace: true,
             ensure_final_newline: true,
+            auto_close_brackets: true,
             clangd_path: String::new(),
             clangd_args: Vec::new(),
             glsl_analyzer_path: String::new(),
@@ -103,6 +106,170 @@ impl Settings {
     }
 }
 
+/// Change one top-level key in settings.json and keep everything else in
+/// the file as it is, comments included. Creates the file if needed.
+pub fn write_setting(key: &str, value: &serde_json::Value) -> Result<(), String> {
+    let path = settings_path().ok_or("Couldn't find a place for settings.json")?;
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|_| default_file_text());
+    let new = set_key_in_text(&text, key, value)?;
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    std::fs::write(&path, new).map_err(|e| format!("Couldn't save settings.json: {e}"))
+}
+
+/// The text of a settings file with `key` set to `value` (see `write_setting`).
+fn set_key_in_text(text: &str, key: &str, value: &serde_json::Value) -> Result<String, String> {
+    let b = text.as_bytes();
+    let json = serde_json::to_string(value).map_err(|e| e.to_string())?;
+    // Skip a string starting at i (a quote); returns the index after it.
+    let skip_str = |mut i: usize| -> usize {
+        i += 1;
+        while i < b.len() && b[i] != b'"' {
+            if b[i] == b'\\' {
+                i += 1;
+            }
+            i += 1;
+        }
+        (i + 1).min(b.len())
+    };
+    let skip_ws = |mut i: usize| -> usize {
+        loop {
+            while i < b.len() && b[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if b.get(i) == Some(&b'/') && b.get(i + 1) == Some(&b'/') {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            } else {
+                return i;
+            }
+        }
+    };
+    let mut depth = 0i32;
+    let mut first_brace = None;
+    let mut i = 0;
+    let mut found = None;
+    while i < b.len() {
+        match b[i] {
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'"' => {
+                let end = skip_str(i);
+                if depth == 1 && text.get(i + 1..end.saturating_sub(1)) == Some(key) {
+                    let colon = skip_ws(end);
+                    if b.get(colon) == Some(&b':') {
+                        found = Some(skip_ws(colon + 1));
+                        break;
+                    }
+                }
+                i = end;
+                continue;
+            }
+            b'{' | b'[' => {
+                if depth == 0 && first_brace.is_none() {
+                    first_brace = Some(i);
+                }
+                depth += 1;
+            }
+            b'}' | b']' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    let out = if let Some(start) = found {
+        // Find where the existing value ends.
+        let mut j = start;
+        let mut d = 0i32;
+        while j < b.len() {
+            match b[j] {
+                b'"' => {
+                    j = skip_str(j);
+                    if d == 0 {
+                        break;
+                    }
+                    continue;
+                }
+                b'{' | b'[' => d += 1,
+                b'}' | b']' => {
+                    if d == 0 {
+                        break;
+                    }
+                    d -= 1;
+                    if d == 0 {
+                        j += 1;
+                        break;
+                    }
+                }
+                b',' | b'\n' if d == 0 => break,
+                b'/' if d == 0 && b.get(j + 1) == Some(&b'/') => break,
+                _ => {}
+            }
+            j += 1;
+        }
+        let end = start + text[start..j].trim_end().len();
+        format!("{}{}{}", &text[..start], json, &text[end..])
+    } else {
+        let brace = first_brace.ok_or("settings.json has no { … } object")?;
+        let rest = &text[brace + 1..];
+        let empty = rest.trim_start().starts_with('}');
+        let comma = if empty { "" } else { "," };
+        format!("{}\n  \"{key}\": {json}{comma}{}", &text[..=brace], rest)
+    };
+    serde_json::from_str::<Settings>(&strip_comments(&out))
+        .map(|_| out)
+        .map_err(|e| format!("Couldn't update settings.json: {e}"))
+}
+
+/// The settings.json spelling of a shortcut, e.g. "Cmd+Shift+K" (parsed back
+/// by `parse_shortcut`). Returns None for keys that can't be bound.
+pub fn shortcut_string(mods: Modifiers, key: Key) -> Option<String> {
+    let mut s = String::new();
+    if cfg!(target_os = "macos") {
+        if mods.ctrl {
+            s.push_str("Ctrl+");
+        }
+        if mods.mac_cmd || mods.command {
+            s.push_str("Cmd+");
+        }
+    } else if mods.ctrl || mods.command {
+        s.push_str("Ctrl+");
+    }
+    if mods.alt {
+        s.push_str("Alt+");
+    }
+    if mods.shift {
+        s.push_str("Shift+");
+    }
+    let k = match key {
+        Key::ArrowLeft => "Left".to_string(),
+        Key::ArrowRight => "Right".to_string(),
+        Key::ArrowUp => "Up".to_string(),
+        Key::ArrowDown => "Down".to_string(),
+        Key::Slash => "/".into(),
+        Key::Backslash => "\\".into(),
+        Key::Period => ".".into(),
+        Key::Comma => ",".into(),
+        Key::Semicolon => ";".into(),
+        Key::OpenBracket => "[".into(),
+        Key::CloseBracket => "]".into(),
+        Key::Equals => "=".into(),
+        Key::Minus => "-".into(),
+        Key::Plus => "+".into(),
+        Key::Backtick => "`".into(),
+        Key::Escape => return None,
+        other => other.name().to_string(),
+    };
+    s.push_str(&k);
+    let sc = parse_shortcut(&s)?;
+    (sc.logical_key == key).then_some(s)
+}
+
 /// Allow `//` line comments in settings.json (outside strings).
 fn strip_comments(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -143,7 +310,8 @@ fn default_file_text() -> String {
     d.keybindings.insert("build".into(), Action::Build.default_shortcut().into());
     let json = serde_json::to_string_pretty(&d).unwrap_or_default();
     s.push_str(&json);
-    s.push_str("\n\n// Actions you can bind in \"keybindings\":\n");
+    s.push_str("\n\n// Themes: system, dark, light, midnight, high-contrast, sepia\n");
+    s.push_str("// Actions you can bind in \"keybindings\":\n");
     for a in Action::ALL {
         s.push_str(&format!("//   \"{}\": \"{}\"\n", a.id(), a.default_shortcut()));
     }
@@ -188,6 +356,13 @@ pub enum Action {
     QuickFix,
     FindReferences,
     Rename,
+    RefactorThis,
+    ExtractVariable,
+    ExtractFunction,
+    InlineVariable,
+    ChangeSignature,
+    SafeDelete,
+    CallHierarchy,
     Format,
     SwitchHeader,
     Back,
@@ -205,6 +380,10 @@ pub enum Action {
     StepInto,
     StepOut,
     Profile,
+    CommandPalette,
+    RecentFiles,
+    MoveLineUp,
+    MoveLineDown,
 }
 
 impl Action {
@@ -242,6 +421,13 @@ impl Action {
         Action::QuickFix,
         Action::FindReferences,
         Action::Rename,
+        Action::RefactorThis,
+        Action::ExtractVariable,
+        Action::ExtractFunction,
+        Action::InlineVariable,
+        Action::ChangeSignature,
+        Action::SafeDelete,
+        Action::CallHierarchy,
         Action::Format,
         Action::SwitchHeader,
         Action::Back,
@@ -259,6 +445,10 @@ impl Action {
         Action::StepInto,
         Action::StepOut,
         Action::Profile,
+        Action::CommandPalette,
+        Action::RecentFiles,
+        Action::MoveLineUp,
+        Action::MoveLineDown,
     ];
 
     pub fn id(self) -> &'static str {
@@ -296,6 +486,13 @@ impl Action {
             Action::QuickFix => "quick_fix",
             Action::FindReferences => "find_references",
             Action::Rename => "rename_symbol",
+            Action::RefactorThis => "refactor_this",
+            Action::ExtractVariable => "extract_variable",
+            Action::ExtractFunction => "extract_function",
+            Action::InlineVariable => "inline_variable",
+            Action::ChangeSignature => "change_signature",
+            Action::SafeDelete => "safe_delete",
+            Action::CallHierarchy => "call_hierarchy",
             Action::Format => "format_file",
             Action::SwitchHeader => "switch_header_source",
             Action::Back => "back",
@@ -313,6 +510,94 @@ impl Action {
             Action::StepInto => "step_into",
             Action::StepOut => "step_out",
             Action::Profile => "profile",
+            Action::CommandPalette => "command_palette",
+            Action::RecentFiles => "recent_files",
+            Action::MoveLineUp => "move_line_up",
+            Action::MoveLineDown => "move_line_down",
+        }
+    }
+
+    /// Human-readable name, for menus, the command palette and the shortcut list.
+    pub fn title(self) -> &'static str {
+        match self {
+            Action::Save => "Save",
+            Action::SaveAs => "Save As…",
+            Action::SaveAll => "Save All",
+            Action::NewFile => "New File",
+            Action::OpenFile => "Open File…",
+            Action::OpenFolder => "Open Folder…",
+            Action::CloseTab => "Close Tab",
+            Action::CloseAllTabs => "Close All Tabs",
+            Action::Find => "Find…",
+            Action::Replace => "Replace…",
+            Action::FindInFiles => "Find in Files…",
+            Action::FindNext => "Find Next",
+            Action::FindPrev => "Find Previous",
+            Action::GotoLine => "Go to Line…",
+            Action::GotoFile => "Go to File…",
+            Action::ToggleSidebar => "Toggle Sidebar",
+            Action::ToggleBottomPanel => "Toggle Bottom Panel",
+            Action::ZoomIn => "Zoom In",
+            Action::ZoomOut => "Zoom Out",
+            Action::ZoomReset => "Reset Zoom",
+            Action::NextTab => "Next Tab",
+            Action::PrevTab => "Previous Tab",
+            Action::Build => "Build",
+            Action::Run => "Run",
+            Action::Stop => "Stop Build / Program",
+            Action::NextProblem => "Next Problem",
+            Action::PrevProblem => "Previous Problem",
+            Action::GotoDefinition => "Go to Definition",
+            Action::GotoDeclaration => "Go to Declaration",
+            Action::GotoSymbol => "Go to Symbol…",
+            Action::QuickFix => "Quick Fix / Refactor…",
+            Action::FindReferences => "Find References",
+            Action::Rename => "Rename Symbol…",
+            Action::RefactorThis => "Refactor This…",
+            Action::ExtractVariable => "Extract Variable…",
+            Action::ExtractFunction => "Extract Function…",
+            Action::InlineVariable => "Inline Variable",
+            Action::ChangeSignature => "Change Signature…",
+            Action::SafeDelete => "Safe Delete…",
+            Action::CallHierarchy => "Call Hierarchy",
+            Action::Format => "Format File",
+            Action::SwitchHeader => "Switch Header/Source",
+            Action::Back => "Navigate Back",
+            Action::Complete => "Autocomplete",
+            Action::ToggleComment => "Toggle Comment",
+            Action::DuplicateLine => "Duplicate Line",
+            Action::DeleteLine => "Delete Line",
+            Action::Settings => "Settings…",
+            Action::ToggleTerminal => "Toggle Terminal",
+            Action::NewTerminal => "New Terminal",
+            Action::Debug => "Start Debugging / Continue",
+            Action::StopDebug => "Stop Debugging",
+            Action::ToggleBreakpoint => "Toggle Breakpoint",
+            Action::StepOver => "Step Over",
+            Action::StepInto => "Step Into",
+            Action::StepOut => "Step Out",
+            Action::Profile => "Profile",
+            Action::CommandPalette => "Command Palette…",
+            Action::RecentFiles => "Recent Files…",
+            Action::MoveLineUp => "Move Line Up",
+            Action::MoveLineDown => "Move Line Down",
+        }
+    }
+
+    /// Group shown next to the action in the palette and the shortcut list.
+    pub fn category(self) -> &'static str {
+        use Action::*;
+        match self {
+            Save | SaveAs | SaveAll | NewFile | OpenFile | OpenFolder | CloseTab | CloseAllTabs | Settings => "File",
+            Find | Replace | FindInFiles | FindNext | FindPrev | ToggleComment | DuplicateLine | DeleteLine
+            | MoveLineUp | MoveLineDown => "Edit",
+            GotoLine | GotoFile | NextTab | PrevTab | NextProblem | PrevProblem | CommandPalette | RecentFiles => "Go",
+            GotoDefinition | GotoDeclaration | GotoSymbol | QuickFix | FindReferences | Rename | Format | SwitchHeader
+            | Back | Complete => "Code",
+            RefactorThis | ExtractVariable | ExtractFunction | InlineVariable | ChangeSignature | SafeDelete | CallHierarchy => "Refactor",
+            Build | Run | Stop | Profile => "Build",
+            Debug | StopDebug | ToggleBreakpoint | StepOver | StepInto | StepOut => "Debug",
+            ToggleSidebar | ToggleBottomPanel | ZoomIn | ZoomOut | ZoomReset | ToggleTerminal | NewTerminal => "View",
         }
     }
 
@@ -352,6 +637,13 @@ impl Action {
             Action::QuickFix => "Alt+Enter",
             Action::FindReferences => "Shift+F12",
             Action::Rename => "F2",
+            Action::RefactorThis => if mac { "Ctrl+T" } else { "Ctrl+Alt+Shift+T" },
+            Action::ExtractVariable => "Cmd+Alt+V",
+            Action::ExtractFunction => "Cmd+Alt+M",
+            Action::InlineVariable => "Cmd+Alt+N",
+            Action::ChangeSignature => "Cmd+F6",
+            Action::SafeDelete => if mac { "Cmd+Delete" } else { "Alt+Delete" },
+            Action::CallHierarchy => "Ctrl+Alt+H",
             Action::Format => "Cmd+Alt+L",
             Action::SwitchHeader => "Alt+O",
             Action::Back => if mac { "Cmd+[" } else { "Alt+Left" },
@@ -369,12 +661,19 @@ impl Action {
             Action::StepInto => "F11",
             Action::StepOut => "Shift+F11",
             Action::Profile => "Cmd+Shift+R",
+            Action::CommandPalette => "Cmd+Shift+P",
+            Action::RecentFiles => "Cmd+E",
+            Action::MoveLineUp => "Alt+Shift+Up",
+            Action::MoveLineDown => "Alt+Shift+Down",
         }
     }
 
     /// Handled inside the editor widget (only when it has focus).
     pub fn is_editor_action(self) -> bool {
-        matches!(self, Action::ToggleComment | Action::DuplicateLine | Action::DeleteLine)
+        matches!(
+            self,
+            Action::ToggleComment | Action::DuplicateLine | Action::DeleteLine | Action::MoveLineUp | Action::MoveLineDown
+        )
     }
 }
 
@@ -543,4 +842,39 @@ mod tests {
         assert_eq!(s.theme, "light");
         assert_eq!(s.font_size, 14.0);
     }
+    #[test]
+    fn set_keys() {
+        let text = "// c\n{\n  \"theme\": \"dark\", // keep me\n  \"font_size\": 14.0,\n  \"clangd_args\": [\n    \"--a\"\n  ],\n  \"keybindings\": {\"build\": \"Cmd+B\"}\n}\n";
+        let t = set_key_in_text(text, "theme", &serde_json::json!("light")).unwrap();
+        assert!(t.contains("\"theme\": \"light\", // keep me"));
+        let t = set_key_in_text(&t, "font_size", &serde_json::json!(16.0)).unwrap();
+        assert!(t.contains("\"font_size\": 16.0,"));
+        let t = set_key_in_text(&t, "clangd_args", &serde_json::json!(["--x", "--y"])).unwrap();
+        assert!(t.contains("\"clangd_args\": [\"--x\",\"--y\"],"));
+        let t = set_key_in_text(&t, "keybindings", &serde_json::json!({"run": "F6"})).unwrap();
+        assert!(t.contains("\"keybindings\": {\"run\":\"F6\"}\n}"));
+        let t = set_key_in_text(&t, "tab_size", &serde_json::json!(2)).unwrap();
+        let s: Settings = serde_json::from_str(&strip_comments(&t)).unwrap();
+        assert_eq!((s.theme.as_str(), s.font_size, s.tab_size), ("light", 16.0, 2));
+        assert_eq!(s.clangd_args, vec!["--x", "--y"]);
+        assert_eq!(s.keybindings.get("run").map(String::as_str), Some("F6"));
+        let t = set_key_in_text("{}", "tab_size", &serde_json::json!(8)).unwrap();
+        let s: Settings = serde_json::from_str(&t).unwrap();
+        assert_eq!(s.tab_size, 8);
+        // The default file round-trips.
+        let t = set_key_in_text(&default_file_text(), "theme", &serde_json::json!("sepia")).unwrap();
+        let s: Settings = serde_json::from_str(&strip_comments(&t)).unwrap();
+        assert_eq!(s.theme, "sepia");
+    }
+
+    #[test]
+    fn shortcut_strings() {
+        for a in Action::ALL {
+            let sc = parse_shortcut(a.default_shortcut()).unwrap();
+            let s = shortcut_string(sc.modifiers, sc.logical_key).unwrap();
+            let back = parse_shortcut(&s).unwrap();
+            assert_eq!(back.logical_key, sc.logical_key, "{s}");
+        }
+    }
+
 }

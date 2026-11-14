@@ -12,11 +12,21 @@ pub fn set_indent_width(n: usize) {
     INDENT_WIDTH.store(n.clamp(1, 16), Ordering::Relaxed);
 }
 
-fn indent_width() -> usize {
+static AUTO_CLOSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_auto_close(on: bool) {
+    AUTO_CLOSE.store(on, Ordering::Relaxed);
+}
+
+pub fn auto_close_enabled() -> bool {
+    AUTO_CLOSE.load(Ordering::Relaxed)
+}
+
+pub fn indent_width() -> usize {
     INDENT_WIDTH.load(Ordering::Relaxed)
 }
 
-fn indent_unit() -> String {
+pub fn indent_unit() -> String {
     " ".repeat(indent_width())
 }
 
@@ -27,6 +37,7 @@ pub fn char_to_byte(text: &str, char_idx: usize) -> usize {
         .unwrap_or(text.len())
 }
 
+#[allow(dead_code)]
 pub fn byte_to_char(text: &str, byte: usize) -> usize {
     let byte = floor_char_boundary(text, byte);
     text[..byte].chars().count()
@@ -302,6 +313,224 @@ pub fn type_closing_brace(text: &mut String, sel: Range<usize>, ch: char) -> usi
     }
 }
 
+/// Move the lines touched by the selection one line up or down, keeping the
+/// selection on the moved text. Returns `None` at the top or bottom.
+pub fn move_lines(text: &mut String, sel: Range<usize>, up: bool) -> Option<Range<usize>> {
+    let (start, end) = selected_lines(text, &sel);
+    let block = text[start..end].to_string();
+    if up {
+        if start == 0 {
+            return None;
+        }
+        let prev_start = line_start(text, start - 1);
+        let prev = text[prev_start..start - 1].to_string();
+        text.replace_range(prev_start..end, &format!("{block}\n{prev}"));
+        let shift = start - prev_start;
+        Some(sel.start - shift..sel.end - shift)
+    } else {
+        if end >= text.len() {
+            return None;
+        }
+        let next_end = line_end(text, end + 1);
+        let next = text[end + 1..next_end].to_string();
+        text.replace_range(start..next_end, &format!("{next}\n{block}"));
+        let shift = next.len() + 1;
+        Some(sel.start + shift..sel.end + shift)
+    }
+}
+
+/// The closing character that auto-close pairs with `open`, if any.
+pub fn closing_pair(open: char) -> Option<char> {
+    match open {
+        '(' => Some(')'),
+        '[' => Some(']'),
+        '{' => Some('}'),
+        '"' => Some('"'),
+        '\'' => Some('\''),
+        _ => None,
+    }
+}
+
+/// Typing an opening bracket or quote. With a selection, wraps it; otherwise
+/// inserts the pair when the next character is whitespace, a closer or the
+/// end of the line. Returns `None` when the character should be typed
+/// normally (for example `'` right after a letter, as in `don't`).
+pub fn auto_close(text: &mut String, sel: Range<usize>, open: char) -> Option<Range<usize>> {
+    let close = closing_pair(open)?;
+    let n = open.len_utf8();
+    if !sel.is_empty() {
+        let inner = text[sel.clone()].to_string();
+        if inner.contains('\n') && open != '{' && open != '(' && open != '[' {
+            return None;
+        }
+        text.replace_range(sel.clone(), &format!("{open}{inner}{close}"));
+        return Some(sel.start + n..sel.end + n);
+    }
+    let next = text[sel.start..].chars().next();
+    let prev = text[..sel.start].chars().next_back();
+    let next_ok = next.is_none_or(|c| c.is_whitespace() || matches!(c, ')' | ']' | '}' | ';' | ','));
+    if !next_ok {
+        return None;
+    }
+    if (open == '"' || open == '\'') && prev.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '\\') {
+        return None;
+    }
+    if (open == '"' || open == '\'') && in_string_or_comment(text, sel.start) {
+        return None;
+    }
+    text.insert_str(sel.start, &format!("{open}{close}"));
+    Some(sel.start + n..sel.start + n)
+}
+
+/// Typing a closer right before the same character just steps over it.
+/// Returns the new cursor when it did.
+pub fn skip_closer(text: &str, sel: &Range<usize>, ch: char) -> Option<usize> {
+    if !sel.is_empty() || !matches!(ch, ')' | ']' | '}' | '"' | '\'') {
+        return None;
+    }
+    text[sel.start..].starts_with(ch).then(|| sel.start + ch.len_utf8())
+}
+
+/// Backspace between an empty pair such as `(|)` removes both characters.
+pub fn delete_pair(text: &mut String, sel: &Range<usize>) -> Option<usize> {
+    if !sel.is_empty() || sel.start == 0 {
+        return None;
+    }
+    let prev = text[..sel.start].chars().next_back()?;
+    let close = closing_pair(prev)?;
+    if !text[sel.start..].starts_with(close) {
+        return None;
+    }
+    let start = sel.start - prev.len_utf8();
+    text.replace_range(start..sel.start + close.len_utf8(), "");
+    Some(start)
+}
+
+/// Rough check for whether `pos` is inside a string, char literal or
+/// comment on its line (enough to avoid pairing quotes inside them).
+fn in_string_or_comment(text: &str, pos: usize) -> bool {
+    let ls = line_start(text, pos);
+    let mut quote: Option<char> = None;
+    let mut chars = text[ls..pos].chars().peekable();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) => {
+                if c == '\\' {
+                    chars.next();
+                } else if c == q {
+                    quote = None;
+                }
+            }
+            None => {
+                if c == '"' || c == '\'' {
+                    quote = Some(c);
+                } else if c == '/' && chars.peek() == Some(&'/') {
+                    return true;
+                }
+            }
+        }
+    }
+    quote.is_some()
+}
+
+/// The bracket matching the one at or just before `pos`, skipping brackets
+/// inside strings and comments. Returns (bracket at cursor, its match).
+#[allow(dead_code)] // for the editor's bracket highlight
+pub fn matching_bracket(text: &str, pos: usize) -> Option<(usize, usize)> {
+    let b = text.as_bytes();
+    let at = |i: usize| -> Option<u8> { b.get(i).copied().filter(|c| b"()[]{}".contains(c)) };
+    let here = if pos < b.len() && at(pos).is_some() {
+        pos
+    } else if pos > 0 && at(pos - 1).is_some() {
+        pos - 1
+    } else {
+        return None;
+    };
+    let code = code_mask(text);
+    if !code[here] {
+        return None;
+    }
+    let c = b[here];
+    let (open, close, forward) = match c {
+        b'(' => (b'(', b')', true),
+        b'[' => (b'[', b']', true),
+        b'{' => (b'{', b'}', true),
+        b')' => (b'(', b')', false),
+        b']' => (b'[', b']', false),
+        _ => (b'{', b'}', false),
+    };
+    let mut depth = 0isize;
+    let mut check = |i: usize| -> Option<usize> {
+        if !code[i] {
+            return None;
+        }
+        if b[i] == open {
+            if forward { depth += 1 } else { depth -= 1 }
+        } else if b[i] == close {
+            if forward { depth -= 1 } else { depth += 1 }
+        }
+        (depth == 0).then_some(i)
+    };
+    if forward {
+        for i in here..b.len() {
+            if let Some(m) = check(i) {
+                return Some((here, m));
+            }
+        }
+    } else {
+        for i in (0..=here).rev() {
+            if let Some(m) = check(i) {
+                return Some((here, m));
+            }
+        }
+    }
+    None
+}
+
+/// For each byte: true if it is code (not inside a string, char literal or
+/// comment). C-style lexing, good enough for C, GLSL and Objective-C.
+#[allow(dead_code)]
+fn code_mask(text: &str) -> Vec<bool> {
+    let b = text.as_bytes();
+    let mut mask = vec![true; b.len()];
+    let mut i = 0;
+    while i < b.len() {
+        let start = i;
+        match b[i] {
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i < b.len() && !(b[i] == b'*' && b.get(i + 1) == Some(&b'/')) {
+                    i += 1;
+                }
+                i = (i + 2).min(b.len());
+            }
+            q @ (b'"' | b'\'') => {
+                i += 1;
+                while i < b.len() && b[i] != q && b[i] != b'\n' {
+                    if b[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                i = (i + 1).min(b.len());
+            }
+            _ => {
+                i += 1;
+                continue;
+            }
+        }
+        for m in &mut mask[start..i.min(b.len())] {
+            *m = false;
+        }
+    }
+    mask
+}
+
 /// Trim trailing whitespace on each line and/or make sure the text ends
 /// with exactly one newline.
 pub fn clean_for_save(text: &str, trim: bool, final_newline: bool) -> String {
@@ -426,4 +655,58 @@ mod tests {
         assert_eq!(byte_to_char(t, t.len()), 11);
         assert_eq!(char_to_byte(t, 2), 3);
     }
+    #[test]
+    fn moving_lines() {
+        let mut t = String::from("a\nbb\nc");
+        let s = move_lines(&mut t, 3..3, true).unwrap();
+        assert_eq!(t, "bb\na\nc");
+        assert_eq!(s, 1..1);
+        let s = move_lines(&mut t, s, false).unwrap();
+        assert_eq!(t, "a\nbb\nc");
+        assert_eq!(s, 3..3);
+        assert!(move_lines(&mut t, 0..0, true).is_none());
+        let n = t.len();
+        assert!(move_lines(&mut t, n..n, false).is_none());
+        // A two-line block.
+        let mut t = String::from("1\n2\n3\n4");
+        let s = move_lines(&mut t, 2..5, false).unwrap();
+        assert_eq!(t, "1\n4\n2\n3");
+        assert_eq!(&t[s], "2\n3");
+    }
+
+    #[test]
+    fn pairs() {
+        let mut t = String::from("f");
+        let s = auto_close(&mut t, 1..1, '(').unwrap();
+        assert_eq!(t, "f()");
+        assert_eq!(s, 2..2);
+        assert_eq!(skip_closer(&t, &s, ')'), Some(3));
+        assert_eq!(delete_pair(&mut t, &s), Some(1));
+        assert_eq!(t, "f");
+        // Not before a word, not after a letter for quotes.
+        let mut t = String::from("x");
+        assert!(auto_close(&mut t, 0..0, '(').is_none());
+        let mut t = String::from("don");
+        assert!(auto_close(&mut t, 3..3, '\'').is_none());
+        // Wrap a selection.
+        let mut t = String::from("a + b");
+        let s = auto_close(&mut t, 0..5, '(').unwrap();
+        assert_eq!(t, "(a + b)");
+        assert_eq!(&t[s], "a + b");
+        // Inside a string.
+        let mut t = String::from("\"ab \"");
+        assert!(auto_close(&mut t, 4..4, '"').is_none());
+    }
+
+    #[test]
+    fn brackets() {
+        let t = "f(a[1], \")\") { /* } */ }";
+        assert_eq!(matching_bracket(t, 1), Some((1, 11)));
+        assert_eq!(matching_bracket(t, 12), Some((11, 1)));
+        let open = t.find('{').unwrap();
+        assert_eq!(matching_bracket(t, open), Some((open, t.len() - 1)));
+        assert_eq!(matching_bracket(t, t.len()), Some((t.len() - 1, open)));
+        assert_eq!(matching_bracket("abc", 1), None);
+    }
+
 }

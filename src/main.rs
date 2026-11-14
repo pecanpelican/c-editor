@@ -2,8 +2,10 @@
 #![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
 
 mod app;
+mod buffer;
 mod editor;
 mod find;
+mod perf;
 mod highlight;
 mod lsp;
 mod dap;
@@ -11,6 +13,8 @@ mod make;
 mod terminal;
 mod profile;
 mod project;
+mod recovery;
+mod refactor;
 mod settings;
 mod textops;
 mod theme;

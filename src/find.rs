@@ -16,36 +16,37 @@ pub struct FindState {
     pub case_sensitive: bool,
     pub whole_word: bool,
     pub focus_query: bool,
-    /// Matches (byte ranges) in the text with hash `text_hash`.
+    /// Matches (byte ranges) in the document `doc_key` = (id, version).
     pub matches: Vec<Range<usize>>,
     pub current: Option<usize>,
-    pub text_hash: u64,
+    pub doc_key: (u64, u64),
     key: u64,
 }
 
 impl FindState {
-    fn options_key(&self, text_hash: u64) -> u64 {
+    fn options_key(&self, doc_key: (u64, u64)) -> u64 {
         let mut h = DefaultHasher::new();
         (
             &self.query,
             self.case_sensitive,
             self.whole_word,
             self.open,
-            text_hash,
+            doc_key,
         )
             .hash(&mut h);
         h.finish()
     }
 
     /// Recompute matches if the query, options or text changed.
-    pub fn update(&mut self, text: &str) {
-        let th = hash_text(text);
-        let key = self.options_key(th);
+    pub fn update(&mut self, doc: &crate::editor::Document) {
+        let text = doc.text.as_str();
+        let dk = (doc.id, doc.version);
+        let key = self.options_key(dk);
         if key == self.key {
             return;
         }
         self.key = key;
-        self.text_hash = th;
+        self.doc_key = dk;
         self.matches = if self.open {
             find_all(text, &self.query, self.case_sensitive, self.whole_word)
         } else {

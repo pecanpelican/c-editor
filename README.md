@@ -87,8 +87,18 @@ For profiling on Linux, install `perf` (see *Performance analyzer* below).
 - Tabs, unsaved markers, prompts before closing or quitting with unsaved work
 - Highlighting for C, Objective-C (.m, .mm), GLSL/shader files and Makefiles, plus type/function/macro colouring
   from clangd
+- **Command palette** (Cmd+Shift+P): every command in one searchable list, with its shortcut.
+  Also switches themes, build targets and recent folders, and remembers what you used last
+- **Recent files** (Cmd+E): jump between the files you worked on; Cmd+E, Enter flips back to
+  the previous one
 - Auto-indent, smart `}` dedent, Tab/Shift+Tab block indent, real tabs in Makefiles
-- Toggle comment, duplicate line, delete line
+- Closes brackets and quotes as you type (and wraps a selection in them), steps over the closer,
+  Backspace removes an empty pair. Turn off in Settings
+- Toggle comment, duplicate line, delete line, move line up/down (Alt+Shift+Up/Down)
+- Crash recovery: unsaved edits are backed up every few seconds and offered back if cedit
+  closes without saving them (a crash, a power cut, a killed process)
+- Status bar: click the line number to go to a line, LF/CRLF to switch line endings, the indent
+  to change it
 - Find/replace (match case, whole word), find in files, go to file (fuzzy), go to line
 - Reloads files changed on disk and warns about conflicting unsaved edits
 - Keeps CRLF line endings; saves atomically; trims trailing whitespace on save (configurable)
@@ -128,6 +138,11 @@ For profiling on Linux, install `perf` (see *Performance analyzer* below).
 
 **Debugger**
 - Click left of a line number (or press F9) to set a breakpoint
+- Conditional breakpoints and log points: *Debug → Edit Breakpoint…* (or right-click it in the
+  Debug panel) to stop only when a C expression is true, or to print a message such as
+  `i = {i}` to the console instead of stopping
+- *Run to Cursor*, *Pause*, *Restart*, *Mute Breakpoints* and *Remove All Breakpoints* in the
+  Debug menu and the command palette
 - **Debug** (F5) builds, then starts your Run program under the debugger. It stops at
   breakpoints and shows where it paused
 - Step over (F10), step into (F11), step out (Shift+F11), continue (F5), stop (Shift+F5)
@@ -210,19 +225,29 @@ Set `"debugger_path"` in settings to pick one, e.g. `"gdb"` or `"/opt/homebrew/o
 
 ## Settings
 
-*File → Settings…* (Cmd+,) opens `settings.json`. Save it to apply changes. It lives in
+*File → Settings…* (Cmd+,) opens the Settings window: theme, font, indent width, auto-closing
+brackets, what happens on save, and paths to clangd, glsl_analyzer and the debugger. Themes:
+Match System, Dark, Light, Midnight, High Contrast and Sepia (also under *View → Theme* and in
+the command palette).
+
+*Help → Keyboard Shortcuts* lists every shortcut. Click one and press new keys to rebind it;
+cedit warns when the keys are already taken.
+
+Both write to `settings.json`, which you can also edit by hand (*Edit settings.json* in the
+Settings window). Your comments in the file are kept. It lives in
 `~/Library/Application Support/cedit/` on macOS, `%APPDATA%\cedit\` on Windows and
 `~/.config/cedit/` on Linux.
 
 ```jsonc
 {
-  "theme": "dark",                 // or "light"
+  "theme": "dark",                 // system, dark, light, midnight, high-contrast, sepia
   "font_size": 14.0,
   "font_path": "",                 // e.g. "/Library/Fonts/JetBrainsMono-Regular.ttf"
   "tab_size": 4,
   "format_on_save": false,         // clang-format C files when saving
   "trim_trailing_whitespace": true,
   "ensure_final_newline": true,
+  "auto_close_brackets": true,
   "clangd_path": "",               // empty = find it automatically
   "clangd_args": [],               // e.g. ["--clang-tidy"]
   "glsl_analyzer_path": "",
@@ -238,6 +263,8 @@ you can rebind. *Help → Keyboard Shortcuts* shows the current bindings.
 
 | Shortcut | Action |
 | --- | --- |
+| Cmd+Shift+P | Command palette |
+| Cmd+E | Recent files |
 | Cmd+P | Go to file |
 | Cmd+F, F3 / Shift+F3 | Find, next, previous |
 | Cmd+Alt+F (mac), Ctrl+H | Replace |
@@ -262,6 +289,7 @@ you can rebind. *Help → Keyboard Shortcuts* shows the current bindings.
 | Cmd+/ | Toggle comment |
 | Cmd+D | Duplicate line or selection |
 | Cmd+Shift+K | Delete line |
+| Alt+Shift+Up / Down | Move line up / down |
 | Tab / Shift+Tab | Indent / unindent |
 | Cmd+S, Cmd+Shift+S, Cmd+Alt+S | Save, save as, save all |
 | Cmd+N, Cmd+O, Cmd+Shift+O | New file, open file, open folder |
@@ -316,6 +344,9 @@ MIT, see [LICENSE](LICENSE).
 | `src/profile.rs` | Reading perf and `sample` output into a call tree |
 | `src/profile_ui.rs` | Profiling runs, hot functions list, flame graph and line shading |
 | `src/settings.rs` | settings.json and the keymap |
-| `src/theme.rs` | Dark and light colours |
+| `src/palette_ui.rs` | Command palette and Recent Files |
+| `src/prefs_ui.rs` | Settings window, theme switching, shortcut editor |
+| `src/recovery.rs` | Backing up unsaved edits and restoring them after a crash |
+| `src/theme.rs` | Colour themes |
 
 Run the tests with `cargo test`.

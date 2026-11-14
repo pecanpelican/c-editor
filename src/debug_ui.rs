@@ -7,6 +7,18 @@ use egui::{Key, RichText, Ui};
 use serde_json::{Value, json};
 
 use super::{App, BottomTab, Modal};
+use serde::{Deserialize, Serialize};
+
+/// A breakpoint's condition and log message, saved with the session.
+#[derive(Clone, Serialize, Deserialize, Default)]
+pub(crate) struct BreakpointSetting {
+    path: PathBuf,
+    line: usize,
+    #[serde(default)]
+    condition: String,
+    #[serde(default)]
+    log: String,
+}
 use crate::dap;
 use crate::make;
 
@@ -87,6 +99,14 @@ enum ConsoleKind {
     Err,
     Info,
     Input,
+}
+
+/// Actions from the breakpoint list in the Debug panel.
+enum BpMenu {
+    Edit(PathBuf, usize),
+    Remove(PathBuf, usize),
+    RemoveAll,
+    Mute(bool),
 }
 
 enum Req {
@@ -180,11 +200,70 @@ pub(crate) struct DebugState {
     mem_input: String,
     mem: Option<MemView>,
     mem_gen: u64,
+    /// Conditions and log messages: file -> line -> (condition, log message).
+    bp_extra: BTreeMap<PathBuf, BTreeMap<usize, (String, String)>>,
+    /// Breakpoints are kept but not sent to the debugger.
+    pub muted: bool,
+    /// Run to Cursor: a temporary breakpoint, removed at the next stop.
+    run_to: Option<(PathBuf, usize)>,
 }
 
 impl DebugState {
     pub fn new(breakpoints: BTreeMap<PathBuf, Vec<usize>>, watches: Vec<String>) -> Self {
         Self { breakpoints, watches, ..Default::default() }
+    }
+
+    pub fn load_breakpoint_settings(&mut self, list: &[BreakpointSetting], muted: bool) {
+        self.muted = muted;
+        for b in list {
+            if self.breakpoints.get(&b.path).is_some_and(|l| l.contains(&b.line)) {
+                self.bp_extra.entry(b.path.clone()).or_default().insert(b.line, (b.condition.clone(), b.log.clone()));
+            }
+        }
+    }
+
+    pub fn breakpoint_settings(&self) -> Vec<BreakpointSetting> {
+        let mut out = Vec::new();
+        for (path, lines) in &self.bp_extra {
+            for (line, (condition, log)) in lines {
+                if !condition.is_empty() || !log.is_empty() {
+                    out.push(BreakpointSetting { path: path.clone(), line: *line, condition: condition.clone(), log: log.clone() });
+                }
+            }
+        }
+        out
+    }
+
+    /// The DAP `breakpoints` list for one file.
+    fn bp_json(&self, path: &Path) -> Vec<Value> {
+        let mut out = Vec::new();
+        if !self.muted {
+            for &l in self.breakpoints.get(path).map(Vec::as_slice).unwrap_or_default() {
+                let mut b = json!({"line": l + 1});
+                if let Some((cond, log)) = self.bp_extra.get(path).and_then(|m| m.get(&l)) {
+                    if !cond.trim().is_empty() {
+                        b["condition"] = json!(cond.trim());
+                    }
+                    if !log.trim().is_empty() {
+                        // Log points print `{expr}` values instead of stopping.
+                        b["logMessage"] = json!(format!("{}\n", log.trim()));
+                    }
+                }
+                out.push(b);
+            }
+        }
+        if let Some((p, l)) = &self.run_to
+            && p == path
+            && !(out.iter().any(|b| b["line"] == json!(l + 1)))
+        {
+            out.push(json!({"line": l + 1}));
+        }
+        out
+    }
+
+    /// Lines in `bp_json(path)` order, to match the adapter's answer.
+    fn bp_lines(&self, path: &Path) -> Vec<usize> {
+        self.bp_json(path).iter().filter_map(|b| b["line"].as_u64()).map(|l| l as usize - 1).collect()
     }
 }
 
@@ -218,6 +297,9 @@ impl App {
         let lines = self.dbg.breakpoints.entry(path.to_path_buf()).or_default();
         if let Some(i) = lines.iter().position(|&l| l == line) {
             lines.remove(i);
+            if let Some(m) = self.dbg.bp_extra.get_mut(path) {
+                m.remove(&line);
+            }
         } else {
             lines.push(line);
             lines.sort_unstable();
@@ -236,12 +318,11 @@ impl App {
     }
 
     fn send_breakpoints(&mut self, path: &Path) {
-        let lines = self.dbg.breakpoints.get(path).cloned().unwrap_or_default();
+        let bps = self.dbg.bp_json(path);
         let Some(s) = &mut self.dbg.session else { return };
         if s.status == Status::Exited {
             return;
         }
-        let bps: Vec<Value> = lines.iter().map(|l| json!({"line": l + 1})).collect();
         let seq = s.client.request("setBreakpoints", json!({"source": {"path": path}, "breakpoints": bps}));
         s.pending.insert(seq, Req::SetBreakpoints(path.to_path_buf()));
     }
@@ -260,14 +341,16 @@ impl App {
         let delta = count as isize - old_count as isize;
         // The edit happened around the cursor: lines below it moved.
         let anchor = old_cursor.min(cursor);
+        let moved = |l: usize| if l > anchor { (l as isize + delta).max(anchor as isize) as usize } else { l };
         if let Some(lines) = self.dbg.breakpoints.get_mut(&path) {
             for l in lines.iter_mut() {
-                if *l > anchor {
-                    *l = (*l as isize + delta).max(anchor as isize) as usize;
-                }
+                *l = moved(*l);
             }
             lines.sort_unstable();
             lines.dedup();
+        }
+        if let Some(m) = self.dbg.bp_extra.get_mut(&path) {
+            *m = std::mem::take(m).into_iter().map(|(l, v)| (moved(l), v)).collect();
         }
         self.send_breakpoints(&path);
     }
@@ -423,6 +506,172 @@ impl App {
         self.dbg.exec = None;
     }
 
+    pub(super) fn debug_menu(&mut self, ui: &mut Ui) {
+        use crate::settings::Action as A;
+        let ctx = ui.ctx().clone();
+        let has_root = self.project_root().is_some();
+        let active = self.debug_active();
+        let stopped = self.debug_stopped();
+        let running = self.dbg.session.as_ref().is_some_and(|s| s.status == Status::Running);
+        let has_file = self.docs.get(self.active).is_some_and(|d| d.path.is_some() && d.viewer.is_none());
+        ui.menu_button("Debug", |ui| {
+            let start = if stopped { "Continue" } else { "Start Debugging" };
+            if ui.add_enabled(has_root && (stopped || !active), egui::Button::new(start).shortcut_text(self.keymap.label(&ctx, A::Debug))).clicked() {
+                self.cmd_debug(&ctx);
+            }
+            if ui.add_enabled(running, egui::Button::new("Pause")).clicked() {
+                self.debug_step("pause");
+            }
+            for (a, cmd) in [(A::StepOver, "next"), (A::StepInto, "stepIn"), (A::StepOut, "stepOut")] {
+                if ui.add_enabled(stopped, egui::Button::new(a.title()).shortcut_text(self.keymap.label(&ctx, a))).clicked() {
+                    self.debug_step(cmd);
+                }
+            }
+            if ui.add_enabled(stopped && has_file, egui::Button::new("Run to Cursor")).clicked() {
+                self.cmd_run_to_cursor(&ctx);
+            }
+            if ui.add_enabled(active, egui::Button::new("Restart")).clicked() {
+                self.cmd_restart_debugging(&ctx);
+            }
+            if ui.add_enabled(active, egui::Button::new("Stop Debugging").shortcut_text(self.keymap.label(&ctx, A::StopDebug))).clicked() {
+                self.cmd_stop_debugging(&ctx);
+            }
+            ui.separator();
+            if ui.add_enabled(has_file, egui::Button::new("Toggle Breakpoint").shortcut_text(self.keymap.label(&ctx, A::ToggleBreakpoint))).clicked() {
+                self.cmd_toggle_breakpoint();
+            }
+            if ui.add_enabled(has_file, egui::Button::new("Edit Breakpoint…")).on_hover_text("Add a condition or log message to the breakpoint on this line").clicked() {
+                self.cmd_edit_breakpoint();
+            }
+            let mut muted = self.dbg.muted;
+            if ui.add_enabled(!self.dbg.breakpoints.is_empty(), egui::Checkbox::new(&mut muted, "Mute Breakpoints")).changed() {
+                self.set_breakpoints_muted(muted);
+            }
+            if ui.add_enabled(!self.dbg.breakpoints.is_empty(), egui::Button::new("Remove All Breakpoints")).clicked() {
+                self.cmd_clear_breakpoints();
+            }
+            ui.separator();
+            if ui.button("Show Debugger").clicked() {
+                self.bottom_open = true;
+                self.bottom_tab = BottomTab::Debug;
+            }
+        });
+    }
+
+    pub(super) fn cmd_restart_debugging(&mut self, ctx: &egui::Context) {
+        if self.debug_active() {
+            self.debug_restart(ctx);
+        } else {
+            self.cmd_debug(ctx);
+        }
+    }
+
+    /// Continue until the line with the cursor (a one-time breakpoint).
+    pub(super) fn cmd_run_to_cursor(&mut self, ctx: &egui::Context) {
+        let Some(doc) = self.docs.get(self.active) else { return };
+        let Some(path) = doc.path.clone() else { return };
+        let line = doc.cursor_line_col.0;
+        if !self.debug_stopped() {
+            self.toast(ctx, "Run to Cursor works while the program is paused", false);
+            return;
+        }
+        self.dbg.run_to = Some((path.clone(), line));
+        self.send_breakpoints(&path);
+        self.debug_step("continue");
+    }
+
+    pub(super) fn cmd_clear_breakpoints(&mut self) {
+        let paths: Vec<PathBuf> = self.dbg.breakpoints.keys().cloned().collect();
+        self.dbg.breakpoints.clear();
+        self.dbg.bp_extra.clear();
+        for p in paths {
+            self.send_breakpoints(&p);
+        }
+    }
+
+    pub(super) fn set_breakpoints_muted(&mut self, muted: bool) {
+        self.dbg.muted = muted;
+        let paths: Vec<PathBuf> = self.dbg.breakpoints.keys().cloned().collect();
+        for p in paths {
+            self.send_breakpoints(&p);
+        }
+    }
+
+    /// Edit the condition / log message of the breakpoint on the cursor line
+    /// (adding the breakpoint if there isn't one).
+    pub(super) fn cmd_edit_breakpoint(&mut self) {
+        let Some(doc) = self.docs.get(self.active) else { return };
+        let Some(path) = doc.path.clone() else { return };
+        let line = doc.cursor_line_col.0;
+        self.edit_breakpoint_at(path, line);
+    }
+
+    fn edit_breakpoint_at(&mut self, path: PathBuf, line: usize) {
+        let (condition, log) = self.dbg.bp_extra.get(&path).and_then(|m| m.get(&line)).cloned().unwrap_or_default();
+        self.modal = Some(Modal::EditBreakpoint { path, line, condition, log, focus: true });
+    }
+
+    pub(super) fn edit_breakpoint_modal(
+        &mut self,
+        ctx: &egui::Context,
+        path: PathBuf,
+        line: usize,
+        mut condition: String,
+        mut log: String,
+        mut focus: bool,
+    ) {
+        let mut done = None;
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        egui::Modal::new(egui::Id::unique("edit-breakpoint")).show(ctx, |ui| {
+            ui.set_width(440.0);
+            ui.heading(format!("Breakpoint at {name}:{}", line + 1));
+            ui.add_space(6.0);
+            ui.label("Stop only when this is true (C expression):");
+            let r = ui.add(egui::TextEdit::singleline(&mut condition).hint_text("e.g. i == 42 && p != NULL").font(egui::TextStyle::Monospace).desired_width(f32::INFINITY));
+            if focus {
+                r.request_focus();
+                focus = false;
+            }
+            ui.add_space(4.0);
+            ui.label("Log a message instead of stopping (put expressions in {braces}):");
+            ui.add(egui::TextEdit::singleline(&mut log).hint_text("e.g. i = {i}, name = {name}").font(egui::TextStyle::Monospace).desired_width(f32::INFINITY));
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button(RichText::new("Remove Breakpoint").color(self.theme.error)).clicked() {
+                    done = Some(Some(false));
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button(RichText::new("OK").strong()).clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
+                        done = Some(Some(true));
+                    }
+                    if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                        done = Some(None);
+                    }
+                });
+            });
+        });
+        match done {
+            None => self.modal = Some(Modal::EditBreakpoint { path, line, condition, log, focus }),
+            Some(None) => {}
+            Some(Some(keep)) => {
+                let lines = self.dbg.breakpoints.entry(path.clone()).or_default();
+                let has = lines.contains(&line);
+                if keep {
+                    if !has {
+                        lines.push(line);
+                        lines.sort_unstable();
+                    }
+                    self.dbg.bp_extra.entry(path.clone()).or_default().insert(line, (condition, log));
+                    self.send_breakpoints(&path);
+                } else if has {
+                    self.toggle_breakpoint(&path, line);
+                } else if lines.is_empty() {
+                    self.dbg.breakpoints.remove(&path);
+                }
+            }
+        }
+    }
+
     fn debug_restart(&mut self, ctx: &egui::Context) {
         self.dbg.session = None;
         self.dbg.exec = None;
@@ -532,12 +781,11 @@ impl App {
         let body = &m["body"];
         match event {
             "initialized" => {
-                let paths: Vec<PathBuf> = self.dbg.breakpoints.keys().cloned().collect();
+                let all: Vec<(PathBuf, Vec<Value>)> =
+                    self.dbg.breakpoints.keys().map(|p| (p.clone(), self.dbg.bp_json(p))).collect();
                 let Some(s) = &mut self.dbg.session else { return };
                 let mut wait = HashSet::new();
-                for p in paths {
-                    let lines = &self.dbg.breakpoints[&p];
-                    let bps: Vec<Value> = lines.iter().map(|l| json!({"line": l + 1})).collect();
+                for (p, bps) in all {
                     let seq = s.client.request("setBreakpoints", json!({"source": {"path": p}, "breakpoints": bps}));
                     s.pending.insert(seq, Req::SetBreakpoints(p));
                     wait.insert(seq);
@@ -551,6 +799,9 @@ impl App {
                 }
             }
             "stopped" => {
+                if let Some((p, _)) = self.dbg.run_to.take() {
+                    self.send_breakpoints(&p);
+                }
                 let Some(s) = &mut self.dbg.session else { return };
                 s.status = Status::Stopped;
                 s.stop_gen += 1;
@@ -731,7 +982,7 @@ impl App {
                 }
             }
             Req::SetBreakpoints(path) => {
-                let lines = self.dbg.breakpoints.get(&path).cloned().unwrap_or_default();
+                let lines = self.dbg.bp_lines(&path);
                 let results = body["breakpoints"].as_array().cloned().unwrap_or_default();
                 for (i, line) in lines.iter().enumerate() {
                     let verified = success && results.get(i).and_then(|b| b["verified"].as_bool()).unwrap_or(false);
@@ -1204,6 +1455,7 @@ impl App {
         let mut add_watch = None;
         let mut repl = None;
         let mut clicked_bp: Option<(PathBuf, usize)> = None;
+        let mut bp_menu: Option<BpMenu> = None;
         let mut actions: Vec<VarAction> = Vec::new();
         let mut hex_changed = false;
         let mut mem_go: Option<String> = None;
@@ -1236,7 +1488,20 @@ impl App {
                     }
                 });
                 ui.add_space(6.0);
-                ui.label(RichText::new("BREAKPOINTS").small().weak());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("BREAKPOINTS").small().weak());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if !self.dbg.breakpoints.is_empty() {
+                            if ui.small_button("Remove All").clicked() {
+                                bp_menu = Some(BpMenu::RemoveAll);
+                            }
+                            let mut muted = self.dbg.muted;
+                            if ui.checkbox(&mut muted, RichText::new("Mute").small()).on_hover_text("Keep the breakpoints but don't stop at them").changed() {
+                                bp_menu = Some(BpMenu::Mute(muted));
+                            }
+                        }
+                    });
+                });
                 egui::ScrollArea::vertical().id_salt("dbg-bps").auto_shrink([false, false]).show(ui, |ui| {
                     if self.dbg.breakpoints.is_empty() {
                         ui.label(RichText::new("Click left of a line number to add one").weak());
@@ -1244,10 +1509,32 @@ impl App {
                     for (path, lines) in &self.dbg.breakpoints {
                         let rel = root.as_ref().and_then(|r| path.strip_prefix(r).ok()).unwrap_or(path);
                         for &l in lines {
-                            let text = RichText::new(format!("{}:{}", rel.display(), l + 1)).font(font.clone());
-                            if ui.add(egui::Button::selectable(false, text).frame_when_inactive(false)).clicked() {
+                            let extra = self.dbg.bp_extra.get(path).and_then(|m| m.get(&l));
+                            let mut job = egui::text::LayoutJob::default();
+                            let color = if self.dbg.muted { theme.comment } else { theme.text };
+                            job.append(&format!("{}:{}", rel.display(), l + 1), 0.0, egui::TextFormat::simple(font.clone(), color));
+                            if let Some((cond, log)) = extra {
+                                if !cond.trim().is_empty() {
+                                    job.append(&format!("  if {}", cond.trim()), 0.0, egui::TextFormat::simple(font.clone(), theme.warning));
+                                }
+                                if !log.trim().is_empty() {
+                                    job.append(&format!("  log \"{}\"", log.trim()), 0.0, egui::TextFormat::simple(font.clone(), theme.function));
+                                }
+                            }
+                            let r = ui.add(egui::Button::selectable(false, job).frame_when_inactive(false)).on_hover_text("Click to go there, right-click for more");
+                            if r.clicked() {
                                 clicked_bp = Some((path.clone(), l));
                             }
+                            r.context_menu(|ui| {
+                                if ui.button("Edit Condition / Log Message…").clicked() {
+                                    bp_menu = Some(BpMenu::Edit(path.clone(), l));
+                                    ui.close();
+                                }
+                                if ui.button("Remove").clicked() {
+                                    bp_menu = Some(BpMenu::Remove(path.clone(), l));
+                                    ui.close();
+                                }
+                            });
                         }
                     }
                 });
@@ -1421,6 +1708,13 @@ impl App {
         if let Some(e) = repl {
             self.dbg.console.push((ConsoleKind::Input, format!("> {e}\n")));
             self.evaluate(e.trim(), EvalKind::Repl, "repl");
+        }
+        match bp_menu {
+            Some(BpMenu::Edit(p, l)) => self.edit_breakpoint_at(p, l),
+            Some(BpMenu::Remove(p, l)) => self.toggle_breakpoint(&p, l),
+            Some(BpMenu::RemoveAll) => self.cmd_clear_breakpoints(),
+            Some(BpMenu::Mute(m)) => self.set_breakpoints_muted(m),
+            None => {}
         }
         if let Some((path, line)) = clicked_bp {
             self.open_file(&path);
